@@ -1,0 +1,49 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Editor settings
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.*
+
+# Local data and generated artifacts
+/data/templates/*
+!/data/templates/.gitkeep
+!/data/templates/README.md
+
+/data/uploads/*
+!/data/uploads/.gitkeep
+
+/data/test/receipts/*
+!/data/test/receipts/.gitkeep
+
+/data/processed/*
+!/data/processed/.gitkeep
+
+# Ignore common spreadsheet formats used for local templates or exports
+*.xlsx
+*.xlsm
+*.xls
+
+# Ignore local images used for testing or development
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.webp

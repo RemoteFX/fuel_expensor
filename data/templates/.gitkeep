@@ -1,0 +1,8 @@
+# Local-only template files
+
+Keep your actual Excel template here, for example:
+
+- FuelExpenseTemplate.xlsx
+- FuelExpenseTemplate.xlsm
+
+This folder is ignored by Git, so files in it will not be uploaded to GitHub.

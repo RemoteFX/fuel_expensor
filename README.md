@@ -1,14 +1,17 @@
 # Fuel Expensor
 
-Fuel Expensor is a tool for turning uploaded receipt images into a completed fuel expense Excel claim using a user-provided template and a simple guided workflow.
+Fuel Expensor turns uploaded receipt images into a completed fuel expense Excel claim using a user-provided template and a guided workflow. Receipt matching is a core part of the application: receipts are matched to expense weeks, and qualifying receipt images are included in the generated documents.
 
 ## Workflow summary
 
 1. User uploads an image containing one or more receipts.
 2. The app detects receipt boundaries and saves each receipt as a separate image.
 3. OCR extracts receipt details such as date, amount, and vendor.
-4. The user selects the date ranges and workdays to expense.
-5. The app populates the spreadsheet template and exports the claim.
+4. The user selects the travel dates and workdays to expense, grouped into expense weeks.
+5. The app matches receipts to each expense week. A receipt qualifies when its date falls within the week or within two calendar days before or after it.
+6. The app checks that every Excel document to be generated has at least one qualifying associated receipt. It notifies the user if a document is missing a receipt.
+7. The app populates the spreadsheet template with the expense data and embeds the associated receipt image(s) in the generated Excel document.
+8. The completed claim is exported.
 
 ## Repository structure
 
@@ -37,4 +40,4 @@ Do not commit actual Excel templates or receipt images.
 
 ## Notes
 
-This repo currently contains the project skeleton only. The app logic and tests will be added next.
+The workflow requires at least one receipt dated within each expense week (with a two-day margin) for every generated Excel document. The user must be notified if a document has no qualifying receipt. Whether that notification blocks export is not yet specified.

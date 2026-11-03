@@ -6,7 +6,7 @@ from ultralytics import YOLO
 
 def get_project_root():
     """Derive project root from script location."""
-    return os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def normalize_path(path, base_dir):
@@ -51,8 +51,8 @@ def crop_receipts(model_path, input_path, output_path):
         if boxes is None or len(boxes) == 0:
             continue
 
-        for box in boxes:
-            x1, y1, x2, y2 = box.xyxy[0].astype(int)
+        xyxy = boxes.xyxy.detach().cpu().numpy().astype(int)  # shape (N, 4)
+        for (x1, y1, x2, y2) in xyxy:
 
             # Apply ~10 pixels of padding
             pad = 10
@@ -90,8 +90,9 @@ def crop_receipts(model_path, input_path, output_path):
 
 
 def main():
+    default_model = os.path.join(get_project_root(), "data", "models", "receipt_detector_2.pt")
     parser = argparse.ArgumentParser(description="Receipt detection using YOLO models")
-    parser.add_argument("--model", type=str, required=True, help="Path to the .pt file (relative to project root)")
+    parser.add_argument("--model", type=str, default=default_model, help="Path to the .pt file (relative to project root). Default: data/models/receipt_detector_2.pt")
     parser.add_argument("--input", type=str, required=True, help="Path to the input image (relative to project root)")
     parser.add_argument("--output", type=str, required=True, help="Path to the output directory (relative to project root)")
     args = parser.parse_args()

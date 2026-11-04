@@ -145,11 +145,14 @@ def match_receipts(
     selection_file: str = str(DEFAULT_SELECTION_PATH),
     created_at: Optional[str] = None,
 ) -> MatchResult:
-    """Associate each dated receipt with every selected week it qualifies for.
+    """Assign each dated receipt to at most one qualifying selected week.
 
     A qualifying interval includes the two days before the configured week
-    start and the two days after its end. Expense week boundaries are obtained
-    from ``src.expense_weeks`` so this module does not define its own calendar.
+    start and the two days after its end. If multiple weeks qualify, prefer
+    the week containing the receipt date; otherwise choose the closest week,
+    breaking ties in favor of the earlier week. Other qualifying weeks are
+    recorded as alternatives, not additional assignments. Expense week
+    boundaries come from ``src.expense_weeks``.
     """
     timestamp = created_at or datetime.now().replace(microsecond=0).isoformat()
     if not isinstance(timestamp, str):
@@ -168,7 +171,13 @@ def match_receipts(
         [] for _ in week_data
     ]
     unmatched = []
+    seen_receipt_ids = set()
     for receipt in receipts:
+        if receipt.receipt_id in seen_receipt_ids:
+            raise ValueError(
+                "Duplicate receipt_id in matching input: {}".format(receipt.receipt_id)
+            )
+        seen_receipt_ids.add(receipt.receipt_id)
         if receipt.receipt_date is None:
             unmatched.append(
                 UnmatchedReceipt(
@@ -197,25 +206,41 @@ def match_receipts(
             )
             continue
 
-        qualifying_week_ids = tuple(
-            week_data[index][0].week_id for index in qualifying_indices
+        containing_indices = [
+            index
+            for index in qualifying_indices
+            if week_data[index][1] <= receipt.receipt_date <= week_data[index][2]
+        ]
+        if containing_indices:
+            assigned_index = containing_indices[0]
+        else:
+            assigned_index = min(
+                qualifying_indices,
+                key=lambda index: (
+                    min(
+                        abs((receipt.receipt_date - week_data[index][1]).days),
+                        abs((receipt.receipt_date - week_data[index][2]).days),
+                    ),
+                    week_data[index][1],
+                ),
+            )
+        week = week_data[assigned_index][0]
+        alternatives = tuple(
+            week_data[index][0].week_id
+            for index in qualifying_indices
+            if index != assigned_index
         )
-        for index in qualifying_indices:
-            week = week_data[index][0]
-            overlaps = tuple(
-                week_id for week_id in qualifying_week_ids if week_id != week.week_id
+        receipts_by_week[assigned_index].append(
+            MatchedReceipt(
+                receipt_id=receipt.receipt_id,
+                receipt_date=receipt.receipt_date.isoformat(),
+                amount=receipt.amount,
+                image_path=receipt.image_path,
+                overlaps_weeks=alternatives,
+                vendor=receipt.vendor,
+                raw_ocr_text=receipt.raw_ocr_text,
             )
-            receipts_by_week[index].append(
-                MatchedReceipt(
-                    receipt_id=receipt.receipt_id,
-                    receipt_date=receipt.receipt_date.isoformat(),
-                    amount=receipt.amount,
-                    image_path=receipt.image_path,
-                    overlaps_weeks=overlaps,
-                    vendor=receipt.vendor,
-                    raw_ocr_text=receipt.raw_ocr_text,
-                )
-            )
+        )
 
     matched_weeks = tuple(
         WeekMatch(

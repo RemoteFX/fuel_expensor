@@ -8,7 +8,7 @@ Fuel Expensor processes receipt images through a guided expense workflow. The cu
 2. The app detects receipt boundaries and saves each receipt as a separate image.
 3. OCR extracts receipt details such as date, amount, and vendor.
 4. The user selects the travel dates and workdays to expense, grouped into expense weeks.
-5. The app matches receipts to each selected expense week. A receipt qualifies when its date falls within the week or within two calendar days before or after it. Overlapping matches are retained for every qualifying week.
+5. The app assigns each receipt to at most one selected expense week. A receipt qualifies when its date falls within the week or within two calendar days before or after it. If adjacent weeks qualify, the week containing the receipt date is chosen; alternate qualifying weeks are recorded without duplicating the receipt.
 6. (Later) Check that every Excel document to be generated has at least one qualifying associated receipt and notify the user if one does not.
 7. (Later) Populate the spreadsheet template and embed associated receipt images.
 8. The completed claim is exported.
@@ -79,16 +79,18 @@ Manifest image paths may be absolute or relative to `data/processed/`.
 `receipt_date`, `amount`, `vendor`, and `raw_ocr_text`. If no manifest is
 present, filename dates are used and the other fields remain empty.
 
-Choose **Match receipts** in the GUI to save the dates currently selected and run matching.
-If no dates are currently selected, it uses the previously saved selection. It reads
+Receipt status is recalculated immediately whenever a date is selected or
+cleared. Selected dates are filled green when their week has a qualifying
+receipt, or orange when it does not; the recheck button can be used after
+receipt files change while the GUI is open. Matching reads
 `data/processed/expense_week_selection.json` and the processed receipt images,
 then writes the version-1 result to
 `data/processed/receipt_matches.json`. Each selected week remains in the result,
 including weeks with zero matches. Dates are compared inclusively from two
 days before the Monday-based week through two days after its Sunday; receipts
-that qualify for adjacent weeks are included in both and list the other week
-IDs in `overlaps_weeks`. The selected calendar dates get a green outline when
-their week has a qualifying receipt and an orange outline when it has none.
+that qualify for adjacent weeks are assigned only once, preferring the week
+that contains the receipt date. Other qualifying weeks are listed in
+`overlaps_weeks` as alternatives and do not contain a duplicate receipt.
 Missing/invalid dates and dated receipts outside every selected week are
 recorded in `unmatched_receipts`. A brief per-week summary, unmatched reasons,
 and output path appear below the calendar; matching no longer opens a results

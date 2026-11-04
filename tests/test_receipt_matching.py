@@ -74,7 +74,7 @@ def test_receipt_one_day_outside_margin_is_unmatched(receipt_date):
     assert result.unmatched_receipts[0].reason == "no_matching_week"
 
 
-def test_receipt_qualifying_for_adjacent_weeks_is_kept_in_both():
+def test_receipt_qualifying_for_adjacent_weeks_is_assigned_once():
     selection = _selection("2025-04-01", "2025-04-08")
 
     result = match_receipts(
@@ -86,9 +86,40 @@ def test_receipt_qualifying_for_adjacent_weeks_is_kept_in_both():
         "2025-03-31",
         "2025-04-07",
     ]
-    assert [week.receipt_count for week in result.weeks] == [1, 1]
+    assert [week.receipt_count for week in result.weeks] == [1, 0]
     assert result.weeks[0].matching_receipts[0].overlaps_weeks == ("2025-04-07",)
+    assigned_receipts = [
+        receipt.receipt_id
+        for week in result.weeks
+        for receipt in week.matching_receipts
+    ]
+    assert assigned_receipts == ["overlap"]
+    assert result.weeks[1].matching_receipts == ()
+
+
+def test_overlapping_receipt_prefers_week_containing_its_date():
+    selection = _selection("2025-04-01", "2025-04-08")
+
+    result = match_receipts(
+        [_receipt("monday", date(2025, 4, 7))],
+        selection,
+    )
+
+    assert [week.receipt_count for week in result.weeks] == [0, 1]
     assert result.weeks[1].matching_receipts[0].overlaps_weeks == ("2025-03-31",)
+
+
+def test_duplicate_receipt_ids_are_rejected():
+    selection = _selection("2025-04-02")
+
+    with pytest.raises(ValueError, match="Duplicate receipt_id"):
+        match_receipts(
+            [
+                _receipt("duplicate", date(2025, 4, 1)),
+                _receipt("duplicate", date(2025, 4, 2)),
+            ],
+            selection,
+        )
 
 
 def test_missing_and_unparseable_receipt_dates_have_distinct_reasons():
@@ -252,11 +283,11 @@ def test_gui_match_action_saves_current_selection_before_matching(
         "2025-03-31": False,
         "2025-04-07": False,
     }
-    assert "orange outlines" in app.match_status_var.value
+    assert "orange dates" in app.match_status_var.value
     assert "receipt_matches.json" in app.match_status_var.value
 
 
-def test_calendar_refresh_draws_match_status_outlines():
+def test_calendar_refresh_colors_selected_dates_by_week_receipt_status():
     class Widget:
         def configure(self, **kwargs):
             self.options = kwargs
@@ -267,9 +298,6 @@ def test_calendar_refresh_draws_match_status_outlines():
         "2025-04-08": Widget(),
         "2025-04-15": Widget(),
     }
-    app.day_frames = {
-        date_text: Widget() for date_text in app.day_buttons
-    }
     app.selected_dates = {"2025-04-01", "2025-04-08"}
     app.week_receipt_status = {
         "2025-03-31": True,
@@ -279,6 +307,19 @@ def test_calendar_refresh_draws_match_status_outlines():
 
     DateSelectionApp._refresh_calendar_buttons(app)
 
-    assert app.day_frames["2025-04-01"].options["style"] == "MatchedBorder.TFrame"
-    assert app.day_frames["2025-04-08"].options["style"] == "UnmatchedBorder.TFrame"
-    assert app.day_frames["2025-04-15"].options["style"] == "DayBorder.TFrame"
+    assert app.day_buttons["2025-04-01"].options["style"] == "Matched.TButton"
+    assert app.day_buttons["2025-04-08"].options["style"] == "Unmatched.TButton"
+    assert app.day_buttons["2025-04-15"].options["style"] == "Day.TButton"
+
+
+def test_date_click_triggers_receipt_check_immediately(monkeypatch):
+    checked = []
+    app = type("App", (), {})()
+    app.selected_dates = set()
+    app.mode = type("Mode", (), {"get": lambda self: "custom"})()
+    app._refresh_calendar_buttons = lambda: None
+    app._match_receipts = lambda: checked.append(set(app.selected_dates))
+
+    DateSelectionApp._on_date_click(app, date(2025, 4, 2))
+
+    assert checked == [{"2025-04-02"}]

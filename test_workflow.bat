@@ -14,6 +14,13 @@ py src\process_receipt_dates.py --input data\processed
 if errorlevel 1 goto workflow_failed
 echo [2_] Receipt date extraction complete.
 echo.
+
+echo [3_] Starting the date-selection GUI...
+py -m src.gui.date_selection
+if errorlevel 1 goto workflow_failed
+echo [3_] Date-selection GUI closed.
+echo.
+
 echo Workflow completed successfully.
 popd
 pause

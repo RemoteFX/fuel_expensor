@@ -1,5 +1,7 @@
 import argparse
 import os
+from pathlib import Path
+
 import cv2
 from ultralytics import YOLO
 
@@ -27,44 +29,73 @@ if not os.path.isdir(os.path.join(PROJECT_ROOT, "data")) or not os.path.isdir(os
 # Default to a built-in Ultralytics model when no custom local model is provided
 DEFAULT_MODEL_NAME = "yolov8n.pt"
 DEFAULT_MODEL_PATH = os.path.join(PROJECT_ROOT, "data", "models", "receipt_detector_2.pt")
+IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 
 
 def crop_receipts(model_path, input_path, output_path):
-    # Load the YOLO model
+    input_is_directory = os.path.isdir(input_path)
+    if input_is_directory:
+        image_paths = sorted(
+            os.path.join(input_path, filename)
+            for filename in os.listdir(input_path)
+            if os.path.isfile(os.path.join(input_path, filename))
+            and Path(filename).suffix.lower() in IMAGE_EXTENSIONS
+        )
+        if not image_paths:
+            raise ValueError(f"No supported image files found in input directory: {input_path}")
+    elif os.path.isfile(input_path):
+        image_paths = [input_path]
+    else:
+        raise FileNotFoundError(f"Input image or directory does not exist: {input_path}")
+
+    os.makedirs(output_path, exist_ok=True)
     model = YOLO(model_path)
-
-    # Read the input image
-    image = cv2.imread(input_path)
-    if image is None:
-        print("Error: Unable to load image.")
-        return
-
-    # Run inference
-    results = model(image)
-
-    # Extract bounding boxes and crop receipts
-    for result in results:
-        boxes = result.boxes.cpu().numpy()
-        for idx, box in enumerate(boxes):
-            xyxy = box.xyxy[0]
-            if hasattr(xyxy, "cpu"):
-                xyxy = xyxy.cpu().numpy()
-            x1, y1, x2, y2 = xyxy.astype(int)
-            x1 = max(0, x1 - 10)
-            y1 = max(0, y1 - 10)
-            x2 = min(image.shape[1], x2 + 10)
-            y2 = min(image.shape[0], y2 + 10)
-
-            # Crop the receipt
-            cropped_receipt = image[y1:y2, x1:x2]
-            output_filename = f"{output_path}/{model_path.split('/')[-1].split('.')[0]}_receipt_{idx + 1}.jpg"
-            cv2.imwrite(output_filename, cropped_receipt)
-
     total_detections = 0
-    for result in results:
-        if result.boxes is not None:
-            total_detections += len(result.boxes)
+
+    for image_path in image_paths:
+        image = cv2.imread(image_path)
+        if image is None:
+            raise ValueError(f"Unable to load image: {image_path}")
+
+        # Run inference
+        results = model(image)
+        image_detections = 0
+
+        # Extract bounding boxes and crop receipts
+        for result in results:
+            if result.boxes is None:
+                continue
+            boxes = result.boxes.cpu().numpy()
+            for box in boxes:
+                xyxy = box.xyxy[0]
+                if hasattr(xyxy, "cpu"):
+                    xyxy = xyxy.cpu().numpy()
+                x1, y1, x2, y2 = xyxy.astype(int)
+                x1 = max(0, x1 - 10)
+                y1 = max(0, y1 - 10)
+                x2 = min(image.shape[1], x2 + 10)
+                y2 = min(image.shape[0], y2 + 10)
+
+                # Crop the receipt
+                cropped_receipt = image[y1:y2, x1:x2]
+                image_detections += 1
+                output_stem = (
+                    Path(image_path).stem
+                    if input_is_directory
+                    else Path(model_path).stem
+                )
+                output_filename = os.path.join(
+                    output_path,
+                    f"{output_stem}_receipt_{image_detections}.jpg",
+                )
+                if not cv2.imwrite(output_filename, cropped_receipt):
+                    raise OSError(f"Unable to write cropped receipt: {output_filename}")
+
+        total_detections += image_detections
+        print(f"{image_path}: {image_detections} receipt(s) detected")
+
     print(f"Number of receipts detected: {total_detections}")
+    return total_detections
 
 
 def resolve_path(path):
@@ -99,7 +130,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Receipt detection using YOLO models")
     parser.add_argument("--model", type=str, default=default_model_path, help="Path to the YOLO model (default: receipt_detector_2.pt or yolov8n.pt)")
-    parser.add_argument("--input", type=str, required=True, help="Path to the input image")
+    parser.add_argument("--input", type=str, required=True, help="Path to an input image or a directory of images")
     parser.add_argument("--output", type=str, required=True, help="Path to the output directory")
     args = parser.parse_args()
 

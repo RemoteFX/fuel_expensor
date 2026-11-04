@@ -34,9 +34,30 @@ Do not commit actual Excel templates or receipt images.
 ## Getting started
 
 1. Clone the repo.
-2. Add your local Excel template file into `data/templates/`.
-3. Add a few sample receipt images into `data/test/receipts/`.
-4. Start implementing the application in `src/`.
+2. Install Python dependencies:
+
+   ```bash
+   py -m pip install -r requirements.txt
+   ```
+
+   This installs `pytesseract` and `Pillow`. **Tesseract OCR** must also be installed separately (see below).
+
+3. Add your local Excel template file into `data/templates/`.
+4. Add a few sample receipt images into `data/test/receipts/`.
+5. Start implementing the application in `src/`.
+
+## Tesseract OCR installation
+
+This project uses Tesseract for OCR. Install it before running the script:
+
+- **Windows:** Download from https://github.com/UB-Mannheim/tesseract/wiki, then add the `tesseract.exe` directory to your system `PATH`.
+- **Linux/macOS:** `sudo apt install tesseract-ocr` or `brew install tesseract`.
+
+Verify installation with:
+
+```bash
+py -m pytesseract --version
+```
 
 ## Notes
 

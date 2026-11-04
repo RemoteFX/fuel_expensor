@@ -3,105 +3,109 @@ import os
 import cv2
 from ultralytics import YOLO
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Resolve project root: find the directory containing both data/ and src/ (repo root)
+PROJECT_ROOT = SCRIPT_DIR
+while not os.path.isdir(os.path.join(PROJECT_ROOT, "data")) or not os.path.isdir(os.path.join(PROJECT_ROOT, "src")):
+    parent = os.path.dirname(PROJECT_ROOT)
+    if parent == PROJECT_ROOT:
+        break
+    PROJECT_ROOT = parent
 
-def get_project_root():
-    """Derive project root from script location."""
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Fallback: ensure we found a valid root with both markers
+if not os.path.isdir(os.path.join(PROJECT_ROOT, "data")) or not os.path.isdir(os.path.join(PROJECT_ROOT, "src")):
+    # Try common known locations relative to script
+    candidates = [
+        os.path.join(SCRIPT_DIR, "..", "fuel_expensor"),
+        os.path.join(SCRIPT_DIR, "..", "fuel_expensor", "data"),
+    ]
+    for candidate in candidates:
+        if os.path.isdir(candidate) and os.path.isdir(os.path.join(candidate, "data")) and os.path.isdir(os.path.join(candidate, "src")):
+            PROJECT_ROOT = candidate
+            break
 
-
-def normalize_path(path, base_dir):
-    """Resolve a path relative to base_dir if it's not already absolute."""
-    if os.path.isabs(path):
-        return os.path.normpath(path)
-    return os.path.normpath(os.path.join(base_dir, path))
+# Default to a built-in Ultralytics model when no custom local model is provided
+DEFAULT_MODEL_NAME = "yolov8n.pt"
+DEFAULT_MODEL_PATH = os.path.join(PROJECT_ROOT, "data", "models", "receipt_detector_2.pt")
 
 
 def crop_receipts(model_path, input_path, output_path):
-    """Run YOLO inference and crop detected receipts."""
-    # Resolve paths relative to project root
-    model_path = normalize_path(model_path, get_project_root())
-    input_path = normalize_path(input_path, get_project_root())
-    output_path = normalize_path(output_path, get_project_root())
-
-    # Validate model file exists
-    if not os.path.isfile(model_path):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
-
-    # Validate input image exists
-    if not os.path.isfile(input_path):
-        raise FileNotFoundError(f"Input image not found: {input_path}")
-
     # Load the YOLO model
-    print(f"Loading model: {model_path}")
     model = YOLO(model_path)
 
     # Read the input image
     image = cv2.imread(input_path)
-    if image is None or image.size == 0:
+    if image is None:
         print("Error: Unable to load image.")
         return
 
-    # Run inference with consistent settings
-    results = model(image, verbose=False)
+    # Run inference
+    results = model(image)
 
     # Extract bounding boxes and crop receipts
-    receipt_count = 0
     for result in results:
-        boxes = result.boxes
-        if boxes is None or len(boxes) == 0:
-            continue
+        boxes = result.boxes.cpu().numpy()
+        for idx, box in enumerate(boxes):
+            xyxy = box.xyxy[0]
+            if hasattr(xyxy, "cpu"):
+                xyxy = xyxy.cpu().numpy()
+            x1, y1, x2, y2 = xyxy.astype(int)
+            x1 = max(0, x1 - 10)
+            y1 = max(0, y1 - 10)
+            x2 = min(image.shape[1], x2 + 10)
+            y2 = min(image.shape[0], y2 + 10)
 
-        xyxy = boxes.xyxy.detach().cpu().numpy().astype(int)  # shape (N, 4)
-        for (x1, y1, x2, y2) in xyxy:
-
-            # Apply ~10 pixels of padding
-            pad = 10
-            x1_padded = max(0, x1 - pad)
-            y1_padded = max(0, y1 - pad)
-            x2_padded = min(image.shape[1], x2 + pad)
-            y2_padded = min(image.shape[0], y2 + pad)
-
-            # Ensure valid crop dimensions
-            if x2_padded <= x1_padded or y2_padded <= y1_padded:
-                continue
-
-            # Crop the receipt from the original image
-            cropped_receipt = image[y1_padded:y2_padded, x1_padded:x2_padded]
-
-            # Create unique output filename using model name prefix
-            model_name = os.path.splitext(os.path.basename(model_path))[0]
-            if not os.path.exists(output_path):
-                os.makedirs(output_path, exist_ok=True)
-
-            existing_files = [f for f in os.listdir(output_path) if f.startswith(model_name + "_receipt_")]
-            index = 1
-            while True:
-                filename = f"{model_name}_receipt_{index}.jpg"
-                if filename not in existing_files:
-                    break
-                index += 1
-
-            output_filename = os.path.join(output_path, filename)
+            # Crop the receipt
+            cropped_receipt = image[y1:y2, x1:x2]
+            output_filename = f"{output_path}/{model_path.split('/')[-1].split('.')[0]}_receipt_{idx + 1}.jpg"
             cv2.imwrite(output_filename, cropped_receipt)
-            receipt_count += 1
 
-    # Print summary
-    print(f"Number of receipts detected: {receipt_count}")
+    total_detections = 0
+    for result in results:
+        if result.boxes is not None:
+            total_detections += len(result.boxes)
+    print(f"Number of receipts detected: {total_detections}")
 
 
-def main():
-    default_model = os.path.join(get_project_root(), "data", "models", "receipt_detector_2.pt")
-    parser = argparse.ArgumentParser(description="Receipt detection using YOLO models")
-    parser.add_argument("--model", type=str, default=default_model, help="Path to the .pt file (relative to project root). Default: data/models/receipt_detector_2.pt")
-    parser.add_argument("--input", type=str, required=True, help="Path to the input image (relative to project root)")
-    parser.add_argument("--output", type=str, required=True, help="Path to the output directory (relative to project root)")
-    args = parser.parse_args()
+def resolve_path(path):
+    """Resolve a path relative to PROJECT_ROOT if it looks like a project-relative path."""
+    # Absolute paths are used as-is
+    if os.path.isabs(path):
+        return path
 
-    try:
-        crop_receipts(args.model, args.input, args.output)
-    except Exception as e:
-        print(f"Error during processing: {e}")
+    # If the path exists as-is (relative to CWD), return it
+    if os.path.isfile(path) or os.path.isdir(path):
+        return path
+
+    # If the path starts with a known project-relative prefix, strip it and resolve against PROJECT_ROOT
+    prefix = "fuel_expensor/"
+    if path.startswith(prefix):
+        stripped = path[len(prefix):]
+        resolved = os.path.join(PROJECT_ROOT, stripped)
+        if os.path.exists(resolved):
+            return resolved
+
+    # Otherwise, try resolving relative to PROJECT_ROOT
+    resolved = os.path.join(PROJECT_ROOT, path)
+    return resolved if os.path.exists(resolved) else path
 
 
 if __name__ == "__main__":
-    main()
+    # Default model: use built-in yolov8n.pt unless a custom local model exists
+    default_model_path = DEFAULT_MODEL_PATH
+    if not os.path.isfile(default_model_path):
+        print(f"Local model '{default_model_path}' not found. Falling back to built-in '{DEFAULT_MODEL_NAME}'.")
+        default_model_path = DEFAULT_MODEL_NAME
+
+    parser = argparse.ArgumentParser(description="Receipt detection using YOLO models")
+    parser.add_argument("--model", type=str, default=default_model_path, help="Path to the YOLO model (default: receipt_detector_2.pt or yolov8n.pt)")
+    parser.add_argument("--input", type=str, required=True, help="Path to the input image")
+    parser.add_argument("--output", type=str, required=True, help="Path to the output directory")
+    args = parser.parse_args()
+
+    # Resolve relative paths against PROJECT_ROOT
+    model_path = resolve_path(args.model)
+    input_path = resolve_path(args.input)
+    output_path = resolve_path(args.output)
+
+    crop_receipts(model_path, input_path, output_path)

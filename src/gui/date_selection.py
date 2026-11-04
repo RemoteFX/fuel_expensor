@@ -16,6 +16,7 @@ from src.expense_weeks import (
     toggle_week_dates,
     weekdays_in_week,
 )
+from src.receipt_matching import run_matching_step
 
 
 class DateSelectionApp:
@@ -42,6 +43,7 @@ class DateSelectionApp:
         self.display_end = self._month_end(self._add_months(self.first_month, 2))
         self.selected_dates: Set[str] = set()
         self.day_buttons: Dict[str, ttk.Button] = {}
+        self.week_receipt_status: Dict[str, bool] = {}
         self.mode = tk.StringVar(value="weeks")
         self.trip_am = tk.BooleanVar(value=True)
         self.trip_pm = tk.BooleanVar(value=True)
@@ -90,6 +92,32 @@ class DateSelectionApp:
                         padding=4, borderwidth=0)
         style.map("Selected.TButton", background=[("active", "#0f56c5")],
                   foreground=[("active", "white")])
+        style.configure(
+            "Matched.TButton",
+            background="#16803c",
+            foreground="white",
+            padding=4,
+            borderwidth=0,
+            relief="flat",
+        )
+        style.map(
+            "Matched.TButton",
+            background=[("active", "#11632f"), ("pressed", "#0e5227")],
+            foreground=[("active", "white"), ("pressed", "white")],
+        )
+        style.configure(
+            "Unmatched.TButton",
+            background="#d97706",
+            foreground="white",
+            padding=4,
+            borderwidth=0,
+            relief="flat",
+        )
+        style.map(
+            "Unmatched.TButton",
+            background=[("active", "#b45309"), ("pressed", "#92400e")],
+            foreground=[("active", "white"), ("pressed", "white")],
+        )
         style.configure("Day.TButton", background=self.CARD, foreground=self.INK,
                         padding=4, borderwidth=0)
         style.map("Day.TButton", background=[("active", self.PALE_BLUE)])
@@ -193,6 +221,12 @@ class DateSelectionApp:
         ttk.Label(legend, text="○ Available day", style="Muted.TLabel").pack(
             side="left", padx=12
         )
+        ttk.Label(
+            legend, text="Green: receipt found", style="Muted.TLabel"
+        ).pack(side="left", padx=12)
+        ttk.Label(
+            legend, text="Orange: no receipt", style="Muted.TLabel"
+        ).pack(side="left", padx=12)
         ttk.Label(legend, text="Clear Selection", style="Muted.TLabel").pack(
             side="right"
         )
@@ -200,8 +234,17 @@ class DateSelectionApp:
             legend, text="⌫", width=3, command=self._clear_selection
         ).pack(side="right", padx=(0, 6))
 
+        self.match_status_var = tk.StringVar()
+        self.match_status_label = ttk.Label(
+            self.calendar_card,
+            textvariable=self.match_status_var,
+            style="Muted.TLabel",
+            justify="left",
+            wraplength=900,
+        )
+
         self.summary_var = tk.StringVar()
-        summary = tk.Label(
+        self.summary_label = tk.Label(
             self.calendar_card,
             textvariable=self.summary_var,
             bg=self.PALE_BLUE,
@@ -211,7 +254,7 @@ class DateSelectionApp:
             pady=8,
             font=("Segoe UI", 9),
         )
-        summary.pack(fill="x", pady=(10, 0))
+        self.summary_label.pack(fill="x", pady=(10, 0))
 
     def _build_settings_panel(self) -> None:
         heading = ttk.Frame(self.settings_card, style="Card.TFrame")
@@ -287,6 +330,11 @@ class DateSelectionApp:
         ttk.Button(footer, text="↻  Reset Selection", command=self._clear_selection).pack(
             side="left"
         )
+        ttk.Button(
+            footer,
+            text="Recheck receipts",
+            command=self._match_receipts,
+        ).pack(side="left", padx=(8, 0))
         ttk.Label(
             footer, textvariable=self.total_var, style="Subtitle.TLabel", anchor="center"
         ).pack(side="left", fill="x", expand=True)
@@ -355,7 +403,7 @@ class DateSelectionApp:
         for column in range(3):
             month = self._add_months(self.first_month, column)
             self._build_month(self.months_frame, month, column)
-        self._refresh_counts()
+        self._refresh_calendar_buttons()
 
     def _build_month(self, parent: ttk.Frame, month: date, column: int) -> None:
         panel = ttk.Frame(parent, style="Card.TFrame", padding=(4, 6))
@@ -386,12 +434,11 @@ class DateSelectionApp:
         self, parent: ttk.Frame, current: date, row: int, column: int
     ) -> None:
         date_text = current.isoformat()
-        selected = date_text in self.selected_dates
         button = ttk.Button(
             parent,
             text=str(current.day),
             width=3,
-            style="Selected.TButton" if selected else "Day.TButton",
+            style="Day.TButton",
             command=lambda value=current: self._on_date_click(value),
         )
         button.grid(row=row, column=column, sticky="nsew", padx=1, pady=2)
@@ -411,6 +458,7 @@ class DateSelectionApp:
             else:
                 self.selected_dates.add(date_text)
         self._refresh_calendar_buttons()
+        self._match_receipts()
 
     def _enabled_dates_in_week(self, week_start: date) -> List[str]:
         """List visible Monday-to-Friday dates in an expense week."""
@@ -424,13 +472,18 @@ class DateSelectionApp:
 
     def _refresh_calendar_buttons(self) -> None:
         for date_text, button in self.day_buttons.items():
-            button.configure(
-                style=(
-                    "Selected.TButton"
-                    if date_text in self.selected_dates
-                    else "Day.TButton"
-                )
-            )
+            is_selected = date_text in self.selected_dates
+            week_id = get_week_bounds(date_text)[0].isoformat()
+            has_receipt = self.week_receipt_status.get(week_id)
+            if not is_selected:
+                button_style = "Day.TButton"
+            elif has_receipt is True:
+                button_style = "Matched.TButton"
+            elif has_receipt is False:
+                button_style = "Unmatched.TButton"
+            else:
+                button_style = "Selected.TButton"
+            button.configure(style=button_style)
         self._refresh_counts()
 
     def _refresh_counts(self) -> None:
@@ -460,6 +513,7 @@ class DateSelectionApp:
     def _clear_selection(self) -> None:
         self.selected_dates.clear()
         self._refresh_calendar_buttons()
+        self._match_receipts()
 
     def _save_selection(self) -> None:
         if not self.selected_dates:
@@ -477,6 +531,50 @@ class DateSelectionApp:
             "Selection saved",
             "Expense dates saved to:\n{}".format(saved_path.resolve()),
             parent=self.root,
+        )
+
+    def _match_receipts(self) -> None:
+        """Save the current selection, match receipts, and update calendar colors."""
+        try:
+            selection = create_selection(self.selected_dates)
+            save_selection(selection, DEFAULT_SELECTION_PATH)
+            result, output_path = run_matching_step(
+                selection_path=DEFAULT_SELECTION_PATH,
+            )
+        except (OSError, ValueError) as error:
+            messagebox.showerror(
+                "Could not match receipts", str(error), parent=self.root
+            )
+            return
+
+        self.week_receipt_status = {
+            week.week_id: week.receipt_count > 0 for week in result.weeks
+        }
+        self._refresh_calendar_buttons()
+
+        lines = [
+            "Receipt matching complete. Green dates have a receipt; "
+            "orange dates do not."
+        ]
+        lines.extend(
+            "{}: {} receipt(s)".format(week.week_id, week.receipt_count)
+            for week in result.weeks
+        )
+        if result.unmatched_receipts:
+            lines.append(
+                "Unmatched: {}".format(
+                    ", ".join(
+                        "{} ({})".format(receipt.receipt_id, receipt.reason)
+                        for receipt in result.unmatched_receipts
+                    )
+                )
+            )
+        else:
+            lines.append("Unmatched: none.")
+        lines.append("Match result: {}".format(output_path.resolve()))
+        self.match_status_var.set("\n".join(lines))
+        self.match_status_label.pack(
+            fill="x", pady=(8, 0), before=self.summary_label
         )
 
 

@@ -1,25 +1,13 @@
-"""
-OCR Receipt Purchase Date Detection and Renaming Workflow.
-
-This script identifies the actual purchase date from fuel receipt images using
-Tesseract OCR, validates UK date conventions, and renames files with the ISO
-date prefix.
-
-Usage:
-    py src/process_receipt_dates.py --input-dir data/processed_receipts
-    py src/process_receipt_dates.py --help
-"""
-
 import argparse
 import logging
 import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import pytesseract
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageOps
 
 # Configure logging
 logging.basicConfig(
@@ -28,435 +16,244 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# UK date patterns - day-first interpretation enforced
-UK_DATE_PATTERNS = [
-    # DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY
-    (r"\b(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{4})\b", 3),
-    # DD-MMM-YYYY e.g. 05-Jun-2023
-    (r"\b(\d{1,2})-([A-Za-z]{3})-(\d{4})\b", 3),
-    # DD MMM YYYY e.g. 05 June 2023
-    (r"\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{4})\b", 3),
-]
+# Supported image extensions
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 
-# Keywords that indicate an explicit transaction date (highest priority)
-PRIORITY_1_KEYWORDS = [
+POSITIVE_KEYWORDS = [
     "transaction date",
     "purchase date",
     "sale date",
     "trans date",
-]
-
-# Keywords indicating generic receipt dates (high priority but context-dependent)
-PRIORITY_2_KEYWORDS = [
     "receipt date",
     "date",
-    "purchase",
-    "transaction",
-]
-
-# Keywords associated with transaction times (supporting evidence)
-PRIORITY_3_INDICATORS = [
     "time",
-    "at",
+    "tax invoice",
+    "sale",
+    "total",
+    "paid",
 ]
 
-# Keywords that should deprioritize or reject a date
-REJECT_KEYWORDS = [
-    "printed",
-    "print date",
-    "receipt generated",
-    "generated on",
-    "card settlement",
-    "settlement date",
-    "payment processing",
+NEGATIVE_KEYWORDS = [
+    "expiry",
+    "expires",
+    "offer",
     "offer ends",
     "promotion ends",
+    "print date",
+    "printed",
     "valid until",
-    "loyalty points expiry",
-    "expiry",
-    "points",
-    "bonus",
-    "reward",
-    "scheme",
+    "valid from",
+    "best before",
+    "use by",
+    "member since",
+    "card ending",
+    "dob",
+    "birth",
     "settlement",
-    "promotion",
 ]
 
-# Month name mapping for month-name date formats
 MONTH_NAMES = {
-    "jan": 1,
-    "feb": 2,
-    "mar": 3,
-    "apr": 4,
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
     "may": 5,
-    "jun": 6,
-    "jul": 7,
-    "aug": 8,
-    "sep": 9,
-    "oct": 10,
-    "nov": 11,
-    "dec": 12,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "september": 9, "sept": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
 }
 
-# Supported image extensions (case-insensitive)
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
-
-class DateCandidate:
-    """Represents a detected date candidate with its context and score."""
-
-    def __init__(self, raw_text: str, date_str: str, score: int, context: str):
-        self.raw_text = raw_text.strip()
-        self.date_str = date_str.strip()
-        self.score = score
-        self.context = context.strip()
-
-    def to_iso(self) -> Optional[str]:
-        """Convert the date string to ISO format (YYYY-MM-DD)."""
-        try:
-            dt = datetime.strptime(self.date_str, "%d/%m/%Y")
-            return dt.strftime("%Y-%m-%d")
-        except ValueError:
-            try:
-                dt = datetime.strptime(self.date_str, "%d-%m-%Y")
-                return dt.strftime("%Y-%m-%d")
-            except ValueError:
-                try:
-                    dt = datetime.strptime(self.date_str, "%d.%m.%Y")
-                    return dt.strftime("%Y-%m-%d")
-                except ValueError:
-                    try:
-                        dt = datetime.strptime(self.date_str, "%d-%b-%Y")
-                        return dt.strftime("%Y-%m-%d")
-                    except ValueError:
-                        try:
-                            dt = datetime.strptime(self.date_str, "%d %B %Y")
-                            return dt.strftime("%Y-%m-%d")
-                        except ValueError:
-                            return None
-
-
-def preprocess_image(image_path: Path) -> Image.Image:
+def preprocess_image(image_path: Path) -> List[Image.Image]:
     """
-    Preprocess an image for OCR using Pillow.
+    Preprocess image with Pillow for optimal OCR legibility on thermal receipts.
+    Combines binarization (thresholding) and contrast enhancement to eliminate thermal noise.
+    """
+    img = Image.open(image_path)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
 
-    Steps:
-    1. Open the image safely.
-    2. Correct orientation using EXIF metadata.
-    3. Convert to grayscale.
-    4. Apply contrast enhancement.
-    5. Apply adaptive thresholding for binarization.
+    gray = ImageOps.grayscale(img)
+
+    thresh150 = gray.point(lambda p: 255 if p > 150 else 0)
+    thresh130 = gray.point(lambda p: 255 if p > 130 else 0)
+    contrast3 = ImageEnhance.Contrast(gray).enhance(3.0)
+    auto_contrast = ImageOps.autocontrast(gray)
+
+    return [thresh150, thresh130, contrast3, auto_contrast, gray]
+
+
+def parse_uk_date(day_s: str, month_s: str, year_s: str) -> Optional[datetime]:
+    """
+    Parse day, month, year strictly following UK date convention (DD/MM/YYYY).
     """
     try:
-        img = Image.open(image_path)
-    except Exception as e:
-        logger.error(f"Failed to open image {image_path}: {e}")
-        raise
+        day = int(day_s)
 
-    # Correct orientation using EXIF data
-    if hasattr(img, "getexif"):
-        try:
-            exif = img.getexif()
-            orientation = exif.get(274)
-            if orientation == 3:
-                img = img.rotate(180, expand=True)
-            elif orientation in (6, 8):
-                img = img.rotate(90 if orientation == 6 else -90, expand=True)
-        except Exception:
-            pass
+        month_s_clean = month_s.strip().lower()
+        if month_s_clean in MONTH_NAMES:
+            month = MONTH_NAMES[month_s_clean]
+        else:
+            month = int(month_s)
 
-    # Convert to grayscale
-    if img.mode != "L":
-        img = img.convert("L")
+        year = int(year_s)
+        if year < 100:
+            year += 2000 if year < 70 else 1900
 
-    # Enhance contrast using histogram equalization
-    img = img.point(lambda x: 255 * (x / 255.0))
+        if not (1 <= month <= 12 and 1 <= day <= 31 and 1990 <= year <= 2035):
+            return None
 
-    # Apply adaptive thresholding for binarization
-    # This helps with thermal receipts that may have faint printing
-    from PIL import ImageOps
-    img = ImageOps.autocontrast(img)
-
-    return img
-
-
-def extract_text(image_path: Path) -> Optional[str]:
-    """
-    Extract text from an image using Tesseract OCR.
-
-    Returns None if Tesseract is unavailable or the image cannot be processed.
-    """
-    try:
-        # Check if Tesseract is available
-        pytesseract.get_tesseract_version()
-    except OSError as e:
-        logger.error(
-            f"Tesseract executable not found: {e}. "
-            "Install Tesseract from https://github.com/UB-Mannheim/tesseract/wiki "
-            "and ensure it's on your PATH."
-        )
-        return None
-
-    try:
-        img = preprocess_image(image_path)
-        text = pytesseract.image_to_string(img, config="--psm 6 --oem 3 -l eng")
-        return text if text.strip() else None
-    except Exception as e:
-        logger.error(f"OCR failed for {image_path}: {e}")
+        return datetime(year, month, day)
+    except (ValueError, TypeError):
         return None
 
 
-def find_date_candidates(text: str) -> list[DateCandidate]:
+def extract_date_candidates(text: str) -> List[tuple]:
     """
-    Find all date candidates in the OCR text with their context and priority.
+    Scans text line by line to locate UK format date candidates with context score.
+    No hardcoded character replacements.
     """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
     candidates = []
 
-    # Priority 1: Explicit transaction dates
-    for keyword in PRIORITY_1_KEYWORDS:
-        pattern = rf"(?i){keyword}\s*[:\-]\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{4}|\d{1,2}[-\s][A-Za-z]{3,9}[-\s]\d{4})"
-        matches = re.finditer(pattern, text)
-        for match in matches:
-            raw_text = match.group(0)
-            date_str = match.group(1)
-            candidates.append(DateCandidate(raw_text, date_str, 100, f"Priority 1: {keyword}"))
+    # UK date regexes: Day/Month/Year or Day Month Year
+    numeric_pattern = re.compile(
+        r'\b([0-3]?\d)[\s/\.\-\\]([0-1]?\d)[\s/\.\-\\](20\d{2}|\d{2})\b'
+    )
+    named_month_pattern = re.compile(
+        r'\b([0-3]?\d)[\s/\.\-]*([A-Za-z]{3,9})[\s/\.\-]*(20\d{2}|\d{2})\b',
+        re.IGNORECASE
+    )
 
-    # Priority 2: Generic receipt dates
-    for keyword in PRIORITY_2_KEYWORDS:
-        pattern = rf"(?i){keyword}\s*[:\-]\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{4}|\d{1,2}[-\s][A-Za-z]{3,9}[-\s]\d{4})"
-        matches = re.finditer(pattern, text)
-        for match in matches:
-            raw_text = match.group(0)
-            date_str = match.group(1)
-            candidates.append(DateCandidate(raw_text, date_str, 75, f"Priority 2: {keyword}"))
+    for i, line in enumerate(lines):
+        window_start = max(0, i - 2)
+        window_end = min(len(lines), i + 3)
+        context_text = " ".join(lines[window_start:window_end]).lower()
 
-    # Priority 3: Dates near transaction times (supporting evidence)
-    time_pattern = r"\b(\d{1,2}:\d{2})\b"
-    time_matches = list(re.finditer(time_pattern, text))
-    for time_match in time_matches:
-        # Look backwards for a date before the time
-        start = max(0, time_match.start() - 40)
-        before_text = text[start:time_match.start()]
-        date_match = re.search(
-            r"(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{4}|\d{1,2}[-\s][A-Za-z]{3,9}[-\s]\d{4})",
-            before_text,
-        )
-        if date_match:
-            raw_text = f"{date_match.group(0)} {time_match.group(1)}"
-            date_str = date_match.group(0)
-            candidates.append(DateCandidate(raw_text, date_str, 60, "Priority 3: near transaction time"))
+        base_score = 10
 
-    # Priority 4: Unlabelled dates in main body (not footer)
-    # Find standalone dates that are not associated with reject keywords
-    date_patterns = [
-        r"\b(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{4})\b",
-        r"\b(\d{1,2}[-\s][A-Za-z]{3,9}[-\s]\d{4})\b",
-    ]
-    for pattern in date_patterns:
-        matches = re.finditer(pattern, text)
-        for match in matches:
-            raw_text = match.group(0)
-            # Check if this date is near reject keywords
-            context_start = max(0, match.start() - 30)
-            context_end = min(len(text), match.end() + 30)
-            context = text[context_start:context_end]
-            is_rejected = any(kw.lower() in context.lower() for kw in REJECT_KEYWORDS)
-            if not is_rejected:
-                candidates.append(DateCandidate(raw_text, raw_text, 40, "Priority 4: unlabelled"))
+        for pos_kw in POSITIVE_KEYWORDS:
+            if pos_kw in context_text:
+                base_score += 15
+
+        for neg_kw in NEGATIVE_KEYWORDS:
+            if neg_kw in context_text:
+                base_score -= 35
+
+        for match in numeric_pattern.finditer(line):
+            day_s, month_s, year_s = match.groups()
+            dt = parse_uk_date(day_s, month_s, year_s)
+            if dt:
+                score = base_score
+                if "date" in line.lower():
+                    score += 20
+                candidates.append((dt, score, line))
+
+        for match in named_month_pattern.finditer(line):
+            day_s, month_s, year_s = match.groups()
+            dt = parse_uk_date(day_s, month_s, year_s)
+            if dt:
+                score = base_score + 10
+                if "date" in line.lower():
+                    score += 20
+                candidates.append((dt, score, line))
 
     return candidates
 
 
-def score_date_candidates(candidates: list[DateCandidate]) -> Optional[str]:
+def extract_best_date(image_path: Path) -> Optional[str]:
     """
-    Score and select the best date candidate.
-
-    Returns ISO date string or None if no reliable date found.
+    Performs OCR and extracts the best valid purchase date as ISO string (YYYY-MM-DD).
     """
-    if not candidates:
-        logger.warning("No date candidates found in receipt text.")
-        return None
+    images = preprocess_image(image_path)
+    configs = ["--psm 6", "--psm 4", "--psm 3", ""]
+    all_candidates = []
 
-    # Filter out rejected candidates
-    valid_candidates = [c for c in candidates if c.score > 0]
+    for img in images:
+        for config in configs:
+            try:
+                ocr_text = pytesseract.image_to_string(img, config=config) if config else pytesseract.image_to_string(img)
+                if ocr_text:
+                    candidates = extract_date_candidates(ocr_text)
+                    all_candidates.extend(candidates)
+                    if any(score >= 25 for _, score, _ in candidates):
+                        break
+            except Exception as e:
+                logger.debug(f"OCR attempt error: {e}")
+                continue
+        if any(score >= 25 for _, score, _ in all_candidates):
+            break
 
+    valid_candidates = [c for c in all_candidates if c[1] > -10]
     if not valid_candidates:
-        logger.warning("No valid date candidates found after rejection filtering.")
         return None
 
-    # Sort by score descending
-    valid_candidates.sort(key=lambda c: c.score, reverse=True)
-
-    # Check for ambiguity - if top two scores are close, flag as ambiguous
-    top_score = valid_candidates[0].score
-    second_score = valid_candidates[1].score if len(valid_candidates) > 1 else 0
-    score_diff = top_score - second_score
-
-    # If the difference is small (within 20 points), consider it ambiguous
-    if score_diff < 20 and len(valid_candidates) >= 2:
-        logger.warning(
-            f"Ambiguous date detected. Top candidates:\n"
-            f"  1. {valid_candidates[0].date_str} ({valid_candidates[0].context})\n"
-            f"  2. {valid_candidates[1].date_str} ({valid_candidates[1].context})"
-        )
-        return None
-
-    # Select the highest-scoring candidate
-    best = valid_candidates[0]
-    iso_date = best.to_iso()
-
-    if iso_date is None:
-        logger.warning(f"Date candidate '{best.date_str}' could not be parsed to ISO format.")
-        return None
-
-    logger.info(f"Purchase date identified: {iso_date}")
-    return iso_date
+    valid_candidates.sort(key=lambda x: x[1], reverse=True)
+    best_dt = valid_candidates[0][0]
+    return best_dt.strftime("%Y-%m-%d")
 
 
-def detect_purchase_date(text: str) -> Optional[str]:
+def process_receipts(input_dir: Path) -> dict:
     """
-    Detect and validate the actual purchase date from OCR text.
-
-    Returns ISO date string or None.
-    """
-    candidates = find_date_candidates(text)
-    return score_date_candidates(candidates)
-
-
-def has_iso_prefix(filename: str) -> bool:
-    """Check if filename already has a valid ISO date prefix."""
-    iso_pattern = r"^(\d{4}-\d{2}-\d{2})_"
-    return bool(re.match(iso_pattern, filename))
-
-
-def rename_receipt(input_path: Path, iso_date: str) -> Optional[Path]:
-    """
-    Rename the receipt file with the ISO date prefix.
-
-    Args:
-        input_path: The original image path.
-        iso_date: The validated ISO date (YYYY-MM-DD).
-
-    Returns:
-        The new path if renamed successfully, or None if no rename occurred.
-    """
-    stem = input_path.stem
-    suffix = input_path.suffix
-
-    # Check if already has ISO prefix
-    if has_iso_prefix(stem):
-        logger.info(f"File already has ISO prefix: {input_path.name}")
-        return None
-
-    # Build new filename
-    new_stem = f"{iso_date}_{stem}"
-    new_path = input_path.parent / (new_stem + suffix)
-
-    # Check for collision - never overwrite existing files
-    if new_path.exists():
-        logger.error(f"Filename collision: {new_path.name} already exists. Not overwriting.")
-        return None
-
-    # Perform rename
-    try:
-        input_path.rename(new_path)
-        logger.info(f"Renamed {input_path.name} -> {new_path.name}")
-        return new_path
-    except Exception as e:
-        logger.error(f"Failed to rename {input_path.name}: {e}")
-        return None
-
-
-def process_directory(input_dir: Path) -> dict:
-    """
-    Process all supported image files in the input directory.
-
-    Returns a summary dictionary with counts.
+    Process all receipt images in directory and prepend ISO date prefix YYYY-MM-DD_.
     """
     summary = {
-        "discovered": 0,
         "processed": 0,
         "renamed": 0,
-        "already_processed": 0,
-        "no_date_found": 0,
-        "manual_review": 0,
-        "errors": 0,
+        "failed": 0,
     }
 
     if not input_dir.exists():
         logger.error(f"Input directory does not exist: {input_dir}")
         return summary
 
-    # Find all supported images (case-insensitive)
-    image_files = [f for f in input_dir.iterdir() if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS]
-    summary["discovered"] = len(image_files)
+    files = [f for f in input_dir.iterdir() if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS]
 
-    for image_path in image_files:
-        logger.info(f"Processing {image_path.name}")
+    iso_prefix_regex = re.compile(r'^\d{4}-\d{2}-\d{2}_')
 
-        try:
-            # Extract text
-            text = extract_text(image_path)
-            if not text:
-                summary["errors"] += 1
-                continue
+    for file_path in files:
+        summary["processed"] += 1
+        clean_name = iso_prefix_regex.sub('', file_path.name)
 
-            # Detect purchase date
-            iso_date = detect_purchase_date(text)
+        logger.info(f"Processing: {file_path.name}")
+        extracted_date = extract_best_date(file_path)
 
-            if iso_date is None:
-                summary["no_date_found"] += 1
-                logger.warning(f"No reliable purchase date found in {image_path.name}")
-                continue
+        if extracted_date:
+            new_name = f"{extracted_date}_{clean_name}"
+            new_path = file_path.parent / new_name
 
-            # Rename file
-            new_path = rename_receipt(image_path)
-            if new_path is None:
-                if has_iso_prefix(image_path.stem):
-                    summary["already_processed"] += 1
-                else:
-                    summary["no_date_found"] += 1
-            else:
+            if file_path != new_path:
+                file_path.rename(new_path)
                 summary["renamed"] += 1
-
-            summary["processed"] += 1
-
-        except Exception as e:
-            summary["errors"] += 1
-            logger.error(f"Error processing {image_path.name}: {e}")
+                logger.info(f"Successfully extracted date {extracted_date} -> Renamed to {new_name}")
+            else:
+                logger.info(f"Filename already up to date: {file_path.name}")
+        else:
+            summary["failed"] += 1
+            logger.warning(f"Could not extract valid date from: {file_path.name}")
 
     return summary
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="OCR receipt purchase date detection and renaming workflow."
-    )
-    parser.add_argument(
-        "--input-dir",
-        type=str,
-        default="data/processed_receipts",
-        help="Directory containing receipt images (default: data/processed_receipts)",
-    )
+    parser = argparse.ArgumentParser(description="OCR receipt date extraction and file renaming.")
+    parser.add_argument("--input-dir", type=str, default="data/processed", help="Path to input directory")
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
+    logger.info(f"Starting receipt date extraction in {input_dir}")
+    summary = process_receipts(input_dir)
 
-    logger.info(f"Starting receipt processing in: {input_dir}")
-
-    summary = process_directory(input_dir)
-
-    # Print final summary
     print("\n" + "=" * 50)
-    print("PROCESSING SUMMARY")
+    print("SUMMARY")
     print("=" * 50)
-    print(f"Images discovered:      {summary['discovered']}")
-    print(f"Successfully processed: {summary['processed']}")
-    print(f"Successfully renamed:   {summary['renamed']}")
-    print(f"Already processed:      {summary['already_processed']}")
-    print(f"No purchase date found: {summary['no_date_found']}")
-    print(f"Manual review required: {summary['manual_review']}")
-    print(f"Files with errors:      {summary['errors']}")
+    print(f"Total processed: {summary['processed']}")
+    print(f"Successfully renamed: {summary['renamed']}")
+    print(f"Failed to extract date: {summary['failed']}")
     print("=" * 50)
 
 

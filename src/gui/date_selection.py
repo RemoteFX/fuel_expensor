@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import argparse
 import calendar
+import queue
+import threading
 import tkinter as tk
 from datetime import date, timedelta
-from tkinter import messagebox, ttk
-from typing import Dict, List, Set
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+from typing import Dict, List, Optional, Set, Tuple
 
 from src.expense_weeks import (
     DEFAULT_SELECTION_PATH,
@@ -16,7 +20,13 @@ from src.expense_weeks import (
     toggle_week_dates,
     weekdays_in_week,
 )
+from src.receipt_processing import (
+    ProcessingProgress,
+    ReceiptProcessingResult,
+    process_uploaded_images,
+)
 from src.receipt_matching import run_matching_step
+from src.receipts import DEFAULT_RECEIPTS_DIRECTORY
 
 
 class DateSelectionApp:
@@ -30,8 +40,15 @@ class DateSelectionApp:
     PALE_BLUE = "#e8f0ff"
     BORDER = "#d8e0ef"
 
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        receipts_directory: Optional[Path] = None,
+    ) -> None:
         self.root = root
+        self.receipts_directory = Path(
+            receipts_directory or DEFAULT_RECEIPTS_DIRECTORY
+        )
         self.root.title("Fuel Expensor - Select Dates")
         self.root.geometry("1120x760")
         self.root.minsize(1000, 690)
@@ -44,18 +61,29 @@ class DateSelectionApp:
         self.selected_dates: Set[str] = set()
         self.day_buttons: Dict[str, ttk.Button] = {}
         self.week_receipt_status: Dict[str, bool] = {}
+        self.weeks_without_receipts: Tuple[str, ...] = ()
+        self.matching_error: Optional[str] = None
+        self.active_receipt_jobs: List[Path] = []
+        self._processing_queue = queue.Queue()
+        self._processing_active = False
         self.mode = tk.StringVar(value="weeks")
         self.trip_am = tk.BooleanVar(value=True)
         self.trip_pm = tk.BooleanVar(value=True)
-        # Placeholder settings for the mock-up; Step 4 persists selected dates only.
+        self.start_postcode = tk.StringVar(value="ZZ99 9ZZ")
+        self.finish_postcode = tk.StringVar(value="ZZ99 9ZY")
         self.fuel_type = tk.StringVar(value="Petrol")
         self.vehicle = tk.StringVar(value="Clio 172")
-        self.additional_options_open = tk.BooleanVar(value=False)
+        self.driver_name = "Your name"
+        self.pt_number = "PT000000"
+        self.vehicle_registration = "AB12 CDE"
+        self.engine_size = "1.6L"
+        self.verbose_output = tk.BooleanVar(value=False)
 
         self._configure_styles()
         self._build_layout()
         self._set_mode(self.mode.get())
         self._render_calendars()
+        self._match_receipts()
 
     @staticmethod
     def _add_months(value: date, months: int) -> date:
@@ -200,6 +228,25 @@ class DateSelectionApp:
             button.pack(side="left", padx=(8 if value == "weeks" else 4, 0))
             self.mode_buttons[value] = button
 
+        upload_bar = ttk.Frame(self.calendar_card, style="Card.TFrame")
+        upload_bar.pack(fill="x", pady=(0, 6))
+        self.upload_button = ttk.Button(
+            upload_bar,
+            text="Add Receipt Photos",
+            command=self._select_receipt_images,
+        )
+        self.upload_button.pack(side="left")
+        self.processing_progress = ttk.Progressbar(
+            upload_bar,
+            mode="determinate",
+            maximum=100,
+            value=0,
+            length=200,
+        )
+        self.processing_progress.pack(
+            side="left", fill="x", expand=True, padx=(8, 0)
+        )
+
         self.mode_hint = tk.StringVar()
         ttk.Label(
             self.calendar_card,
@@ -235,13 +282,22 @@ class DateSelectionApp:
         ).pack(side="right", padx=(0, 6))
 
         self.match_status_var = tk.StringVar()
-        self.match_status_label = ttk.Label(
-            self.calendar_card,
-            textvariable=self.match_status_var,
-            style="Muted.TLabel",
-            justify="left",
-            wraplength=900,
+        self.diagnostics_frame = ttk.Frame(self.calendar_card, style="Card.TFrame")
+        self.diagnostics_text = tk.Text(
+            self.diagnostics_frame,
+            height=7,
+            wrap="word",
+            state="disabled",
+            font=("Consolas", 8),
         )
+        diagnostics_scrollbar = ttk.Scrollbar(
+            self.diagnostics_frame,
+            orient="vertical",
+            command=self.diagnostics_text.yview,
+        )
+        self.diagnostics_text.configure(yscrollcommand=diagnostics_scrollbar.set)
+        self.diagnostics_text.pack(side="left", fill="both", expand=True)
+        diagnostics_scrollbar.pack(side="right", fill="y")
 
         self.summary_var = tk.StringVar()
         self.summary_label = tk.Label(
@@ -269,11 +325,13 @@ class DateSelectionApp:
         ).pack(side="right")
 
         self._field_label(self.settings_card, "Start Postcode")
-        # Placeholder only: this fake postcode is for the visual mock-up, not a real address.
-        self._placeholder_entry(self.settings_card, "ZZ99 9ZZ")
+        ttk.Entry(self.settings_card, textvariable=self.start_postcode).pack(
+            fill="x", pady=(0, 9)
+        )
         self._field_label(self.settings_card, "Finish Postcode")
-        # Placeholder only: this fake postcode is for the visual mock-up, not a real address.
-        self._placeholder_entry(self.settings_card, "ZZ99 9ZY")
+        ttk.Entry(self.settings_card, textvariable=self.finish_postcode).pack(
+            fill="x", pady=(0, 9)
+        )
 
         self._field_label(self.settings_card, "Fuel Type")
         ttk.Combobox(
@@ -304,24 +362,6 @@ class DateSelectionApp:
             command=self._refresh_counts,
         ).pack(anchor="w", pady=4)
 
-        options = ttk.Frame(self.settings_card, style="Card.TFrame")
-        options.pack(fill="x", pady=(14, 0))
-        ttk.Checkbutton(
-            options,
-            text="Additional Options",
-            variable=self.additional_options_open,
-            command=self._toggle_additional_options,
-        ).pack(anchor="w")
-        self.additional_options = ttk.Label(
-            options,
-            text="Settings shown here are visual placeholders.\nThey are not included in the date-selection file.",
-            style="Muted.TLabel",
-            wraplength=250,
-            justify="left",
-        )
-        self.additional_options.pack(anchor="w", pady=(6, 0))
-        self.additional_options.pack_forget()
-
     def _build_footer(self, parent: ttk.Frame) -> None:
         footer = ttk.Frame(parent, style="App.TFrame", padding=(0, 12, 0, 0))
         footer.pack(fill="x")
@@ -340,7 +380,7 @@ class DateSelectionApp:
         ).pack(side="left", fill="x", expand=True)
         self.submit_button = ttk.Button(
             footer,
-            text="▣  Submit Expense  →",
+            text="▣  Save Selection  →",
             style="Primary.TButton",
             command=self._save_selection,
             state="disabled",
@@ -353,24 +393,131 @@ class DateSelectionApp:
             anchor="w", pady=(0, 4)
         )
 
-    @staticmethod
-    def _placeholder_entry(parent: ttk.Frame, value: str) -> None:
-        entry = ttk.Entry(parent)
-        entry.insert(0, value)
-        entry.pack(fill="x", pady=(0, 9))
-
-    def _toggle_additional_options(self) -> None:
-        if self.additional_options_open.get():
-            self.additional_options.pack(anchor="w", pady=(6, 0))
-        else:
-            self.additional_options.pack_forget()
-
     def _show_settings_placeholder(self) -> None:
-        messagebox.showinfo(
-            "Settings",
-            "The expense details are visual placeholders and are not saved yet.",
-            parent=self.root,
+        window = tk.Toplevel(self.root)
+        window.title("Manage Settings")
+        window.transient(self.root)
+        window.resizable(False, False)
+        window.configure(bg=self.BG)
+
+        container = ttk.Frame(window, style="App.TFrame", padding=18)
+        container.pack(fill="both", expand=True)
+        ttk.Label(
+            container,
+            text="Expense details",
+            style="Header.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(
+            container,
+            text="Placeholder values for the future workbook integration. "
+            "Changes apply for this session only.",
+            style="Subtitle.TLabel",
+            wraplength=420,
+        ).pack(anchor="w", pady=(2, 12))
+
+        settings = (
+            ("Start Postcode", self.start_postcode.get()),
+            ("Finish Postcode", self.finish_postcode.get()),
+            ("Driver Name", self.driver_name),
+            ("PT Number", self.pt_number),
+            ("Vehicle Registration", self.vehicle_registration),
+            ("Engine Size", self.engine_size),
         )
+        fields = {}
+        for label, value in settings:
+            ttk.Label(container, text=label).pack(anchor="w", pady=(5, 2))
+            field = ttk.Entry(container, width=48)
+            field.insert(0, value)
+            field.pack(fill="x")
+            fields[label] = field
+
+        ttk.Label(container, text="Fuel Type").pack(anchor="w", pady=(9, 2))
+        fuel_type = tk.StringVar(value=self.fuel_type.get())
+        ttk.Combobox(
+            container,
+            textvariable=fuel_type,
+            values=("Petrol", "Diesel", "Electric"),
+            state="readonly",
+        ).pack(fill="x")
+
+        ttk.Label(container, text="Vehicle").pack(anchor="w", pady=(9, 2))
+        vehicle = tk.StringVar(value=self.vehicle.get())
+        ttk.Combobox(
+            container,
+            textvariable=vehicle,
+            values=("Clio 172", "Other"),
+            state="readonly",
+        ).pack(fill="x")
+
+        trips = ttk.Frame(container, style="App.TFrame")
+        trips.pack(fill="x", pady=(10, 0))
+        trip_am = tk.BooleanVar(value=self.trip_am.get())
+        trip_pm = tk.BooleanVar(value=self.trip_pm.get())
+        verbose_output = tk.BooleanVar(value=self.verbose_output.get())
+        ttk.Checkbutton(
+            trips, text="AM Trip", variable=trip_am
+        ).pack(side="left")
+        ttk.Checkbutton(
+            trips, text="PM Trip", variable=trip_pm
+        ).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(
+            container,
+            text="Show verbose processing diagnostics",
+            variable=verbose_output,
+        ).pack(anchor="w", pady=(12, 0))
+
+        buttons = ttk.Frame(container, style="App.TFrame")
+        buttons.pack(fill="x", pady=(16, 0))
+        ttk.Button(buttons, text="Cancel", command=window.destroy).pack(side="right")
+
+        def save_settings() -> None:
+            self.start_postcode.set(fields["Start Postcode"].get())
+            self.finish_postcode.set(fields["Finish Postcode"].get())
+            self.driver_name = fields["Driver Name"].get()
+            self.pt_number = fields["PT Number"].get()
+            self.vehicle_registration = fields["Vehicle Registration"].get()
+            self.engine_size = fields["Engine Size"].get()
+            self.fuel_type.set(fuel_type.get())
+            self.vehicle.set(vehicle.get())
+            self.trip_am.set(trip_am.get())
+            self.trip_pm.set(trip_pm.get())
+            self.verbose_output.set(verbose_output.get())
+            self._toggle_verbose_output()
+            self._refresh_counts()
+            window.destroy()
+
+        ttk.Button(
+            buttons,
+            text="Save",
+            style="Primary.TButton",
+            command=save_settings,
+        ).pack(side="right", padx=(0, 8))
+        window.update_idletasks()
+        window.geometry(
+            "+{}+{}".format(
+                self.root.winfo_rootx() + 40,
+                self.root.winfo_rooty() + 40,
+            )
+        )
+        window.grab_set()
+
+    def _toggle_verbose_output(self) -> None:
+        if self.verbose_output.get():
+            self.diagnostics_frame.pack(
+                fill="both", expand=False, pady=(8, 0), before=self.summary_label
+            )
+            if self.match_status_var.get():
+                self._append_diagnostic(self.match_status_var.get(), replace=True)
+        else:
+            self.diagnostics_frame.pack_forget()
+
+    def _append_diagnostic(self, message: str, replace: bool = False) -> None:
+        self.diagnostics_text.configure(state="normal")
+        if replace:
+            self.diagnostics_text.delete("1.0", "end")
+        self.diagnostics_text.insert("end", message.rstrip() + "\n")
+        self.diagnostics_text.see("end")
+        self.diagnostics_text.configure(state="disabled")
 
     def _set_mode(self, mode: str) -> None:
         self.mode.set(mode)
@@ -429,6 +576,115 @@ class DateSelectionApp:
                     continue
                 current = date(month.year, month.month, day_number)
                 self._add_day_button(panel, current, row_index, weekday)
+
+    def _select_receipt_images(self) -> None:
+        image_paths = filedialog.askopenfilenames(
+            parent=self.root,
+            title="Select receipt photos",
+            filetypes=[
+                ("Receipt images", "*.bmp *.jpeg *.jpg *.png *.tif *.tiff *.webp"),
+                ("All files", "*.*"),
+            ],
+        )
+        if image_paths:
+            self._start_receipt_processing(tuple(Path(path) for path in image_paths))
+
+    def _start_receipt_processing(self, image_paths: Tuple[Path, ...]) -> None:
+        if self._processing_active:
+            return
+        self._processing_active = True
+        self.upload_button.configure(state="disabled")
+        self.processing_progress.configure(value=0)
+        worker = threading.Thread(
+            target=self._receipt_processing_worker,
+            args=(image_paths, self.verbose_output.get()),
+            daemon=True,
+        )
+        worker.start()
+        self.root.after(100, self._poll_receipt_processing)
+
+    def _receipt_processing_worker(
+        self, image_paths: Tuple[Path, ...], verbose: bool = False
+    ) -> None:
+        try:
+            result = process_uploaded_images(
+                image_paths,
+                verbose=verbose,
+                progress_callback=lambda progress: self._processing_queue.put(
+                    ("progress", progress)
+                ),
+                log_callback=lambda message: self._processing_queue.put(
+                    ("log", message)
+                ),
+            )
+        except Exception as error:
+            self._processing_queue.put(("error", str(error)))
+        else:
+            self._processing_queue.put(("complete", result))
+
+    def _poll_receipt_processing(self) -> None:
+        while True:
+            try:
+                event, value = self._processing_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if event == "log":
+                if self.verbose_output.get():
+                    self._append_diagnostic(value)
+            elif event == "progress":
+                progress: ProcessingProgress = value
+                stage_fraction = (
+                    progress.completed / progress.total
+                    if progress.total
+                    else 0
+                )
+                overall_progress = (
+                    50 * stage_fraction
+                    if progress.stage == "detecting"
+                    else 50 + 49 * stage_fraction
+                )
+                self.processing_progress.configure(
+                    value=max(0, min(99, overall_progress))
+                )
+            elif event == "error":
+                self._processing_active = False
+                self.upload_button.configure(state="normal")
+                if self.verbose_output.get():
+                    self._append_diagnostic(
+                        "Receipt processing failed: {}".format(value)
+                    )
+                messagebox.showerror(
+                    "Receipt processing failed", value, parent=self.root
+                )
+            elif event == "complete":
+                result: ReceiptProcessingResult = value
+                self._processing_active = False
+                self.upload_button.configure(state="normal")
+                self.active_receipt_jobs.append(result.output_directory)
+                self.processing_progress.configure(value=100)
+                if self.verbose_output.get():
+                    self._append_diagnostic(
+                        "Processing complete: {} image(s), {} receipt(s), "
+                        "{} error(s), {} warning(s). Output: {}".format(
+                            result.input_count,
+                            result.detected_receipt_count,
+                            len(result.errors),
+                            len(result.warnings),
+                            result.output_directory,
+                        )
+                    )
+                if result.errors or result.warnings:
+                    details = list(result.errors) + list(result.warnings)
+                    messagebox.showwarning(
+                        "Receipt processing finished with issues",
+                        "\n".join(details),
+                        parent=self.root,
+                    )
+                self._match_receipts()
+
+        if self._processing_active:
+            self.root.after(100, self._poll_receipt_processing)
 
     def _add_day_button(
         self, parent: ttk.Frame, current: date, row: int, column: int
@@ -527,11 +783,32 @@ class DateSelectionApp:
                 "Could not save selection", str(error), parent=self.root
             )
             return
-        messagebox.showinfo(
-            "Selection saved",
-            "Expense dates saved to:\n{}".format(saved_path.resolve()),
-            parent=self.root,
-        )
+        if self.weeks_without_receipts:
+            messagebox.showwarning(
+                "Selection saved with receipt warnings",
+                "Expense dates saved to:\n{}\n\n"
+                "No receipt was matched to these weeks: {}. "
+                "They will not be included in an expense form.".format(
+                    saved_path.resolve(),
+                    ", ".join(self.weeks_without_receipts),
+                ),
+                parent=self.root,
+            )
+        elif self.matching_error is not None:
+            messagebox.showwarning(
+                "Receipt coverage could not be verified",
+                "Expense dates were saved, but receipt matching failed. "
+                "Check the receipt status before creating an expense form.\n\n{}".format(
+                    self.matching_error
+                ),
+                parent=self.root,
+            )
+        else:
+            messagebox.showinfo(
+                "Selection saved",
+                "Expense dates saved to:\n{}".format(saved_path.resolve()),
+                parent=self.root,
+            )
 
     def _match_receipts(self) -> None:
         """Save the current selection, match receipts, and update calendar colors."""
@@ -540,16 +817,32 @@ class DateSelectionApp:
             save_selection(selection, DEFAULT_SELECTION_PATH)
             result, output_path = run_matching_step(
                 selection_path=DEFAULT_SELECTION_PATH,
+                receipts_directory=self.receipts_directory,
+                manifest_path=self.receipts_directory / "receipt_manifest.json",
+                receipt_job_directories=self.active_receipt_jobs,
             )
         except (OSError, ValueError) as error:
+            self.matching_error = str(error)
+            self.week_receipt_status = {}
+            self.weeks_without_receipts = ()
+            self._refresh_calendar_buttons()
+            self.match_status_var.set(
+                "Receipt matching failed: {}".format(self.matching_error)
+            )
+            if self.verbose_output.get():
+                self._append_diagnostic(
+                    self.match_status_var.get(), replace=True
+                )
             messagebox.showerror(
                 "Could not match receipts", str(error), parent=self.root
             )
             return
 
+        self.matching_error = None
         self.week_receipt_status = {
             week.week_id: week.receipt_count > 0 for week in result.weeks
         }
+        self.weeks_without_receipts = result.weeks_without_receipts
         self._refresh_calendar_buttons()
 
         lines = [
@@ -560,11 +853,23 @@ class DateSelectionApp:
             "{}: {} receipt(s)".format(week.week_id, week.receipt_count)
             for week in result.weeks
         )
+        if self.weeks_without_receipts:
+            lines.append(
+                "Warning: weeks without receipts will not be included in an expense form: {}.".format(
+                    ", ".join(self.weeks_without_receipts)
+                )
+            )
         if result.unmatched_receipts:
             lines.append(
                 "Unmatched: {}".format(
                     ", ".join(
-                        "{} ({})".format(receipt.receipt_id, receipt.reason)
+                        "{} ({}){}".format(
+                            receipt.receipt_id,
+                            receipt.reason,
+                            ": {}".format(receipt.date_error)
+                            if receipt.date_error
+                            else "",
+                        )
                         for receipt in result.unmatched_receipts
                     )
                 )
@@ -573,15 +878,22 @@ class DateSelectionApp:
             lines.append("Unmatched: none.")
         lines.append("Match result: {}".format(output_path.resolve()))
         self.match_status_var.set("\n".join(lines))
-        self.match_status_label.pack(
-            fill="x", pady=(8, 0), before=self.summary_label
-        )
+        if self.verbose_output.get():
+            self._append_diagnostic(self.match_status_var.get(), replace=True)
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     """Launch the date-selection window."""
+    parser = argparse.ArgumentParser(description="Select travel dates and match receipts.")
+    parser.add_argument(
+        "--receipts-dir",
+        type=Path,
+        default=DEFAULT_RECEIPTS_DIRECTORY,
+        help="Directory containing processed receipt images",
+    )
+    args = parser.parse_args(argv)
     root = tk.Tk()
-    DateSelectionApp(root)
+    DateSelectionApp(root, receipts_directory=args.receipts_dir)
     root.mainloop()
 
 

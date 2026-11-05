@@ -119,7 +119,11 @@ def _load_manifest(
             )
         image_path = Path(image_path_value)
         if not image_path.is_absolute():
-            candidates = (receipts_directory / image_path, PROJECT_ROOT / image_path)
+            candidates = (
+                manifest_path.parent / image_path,
+                receipts_directory / image_path,
+                PROJECT_ROOT / image_path,
+            )
             image_path = next(
                 (candidate for candidate in candidates if candidate.is_file()),
                 candidates[0],
@@ -129,6 +133,11 @@ def _load_manifest(
             raise FileNotFoundError(
                 "Receipt image does not exist: {}".format(image_path)
             )
+        date_error = entry.get("date_error")
+        if date_error is not None and not isinstance(date_error, str):
+            raise ValueError(
+                "date_error in manifest entry {} must be a string.".format(index)
+            )
         loaded.append((image_path, entry))
     return loaded
 
@@ -136,6 +145,7 @@ def _load_manifest(
 def load_receipts(
     receipts_directory: Path = DEFAULT_RECEIPTS_DIRECTORY,
     manifest_path: Optional[Path] = DEFAULT_RECEIPT_MANIFEST_PATH,
+    include_incomplete: bool = False,
 ) -> Tuple[Receipt, ...]:
     """Load processed receipt images, using filename dates and optional metadata.
 
@@ -149,17 +159,38 @@ def load_receipts(
             "Processed receipts directory does not exist: {}".format(directory)
         )
 
-    manifest_entries = (
-        _load_manifest(Path(manifest_path), directory)
-        if manifest_path is not None and Path(manifest_path).is_file()
-        else []
-    )
+    manifest_paths = set()
+    if manifest_path is not None and Path(manifest_path).is_file():
+        manifest_paths.add(Path(manifest_path).resolve())
+    for path in directory.rglob("receipt_manifest.json"):
+        relative_parts = path.parent.relative_to(directory).parts
+        containing_directories = [
+            directory.joinpath(*relative_parts[:index])
+            for index in range(len(relative_parts) + 1)
+        ]
+        if any((parent / ".incomplete").is_file() for parent in containing_directories):
+            continue
+        manifest_paths.add(path.resolve())
+    manifest_entries = [
+        entry
+        for path in sorted(manifest_paths)
+        for entry in _load_manifest(path, directory)
+    ]
     metadata_by_image = {str(path): entry for path, entry in manifest_entries}
-    image_paths = {
-        path.resolve()
-        for path in directory.iterdir()
-        if path.is_file() and path.suffix.lower() in _IMAGE_EXTENSIONS
-    }
+    image_paths = set()
+    for path in directory.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in _IMAGE_EXTENSIONS:
+            continue
+        relative_parts = path.relative_to(directory).parts
+        containing_directories = [
+            directory.joinpath(*relative_parts[:index])
+            for index in range(len(relative_parts))
+        ]
+        if not include_incomplete and any(
+            (parent / ".incomplete").is_file() for parent in containing_directories
+        ):
+            continue
+        image_paths.add(path.resolve())
     image_paths.update(path for path, _ in manifest_entries)
 
     receipts = []
@@ -170,6 +201,13 @@ def load_receipts(
         receipt_date, date_error = _parse_manifest_date(
             entry.get("receipt_date"), filename_date
         )
+        manifest_date_error = entry.get("date_error")
+        if receipt_date is None and manifest_date_error is not None:
+            if not isinstance(manifest_date_error, str):
+                raise ValueError(
+                    "date_error for receipt metadata must be a string."
+                )
+            date_error = manifest_date_error
         receipt_id = entry.get("receipt_id", image_path.name)
         if not isinstance(receipt_id, str) or not receipt_id.strip():
             raise ValueError("Receipt IDs in the manifest must be non-empty strings.")

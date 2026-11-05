@@ -4,12 +4,12 @@ Fuel Expensor processes receipt images through a guided expense workflow. The cu
 
 ## Workflow summary
 
-1. User uploads an image containing one or more receipts.
-2. The app detects receipt boundaries and saves each receipt as a separate image.
-3. OCR extracts receipt details such as date, amount, and vendor.
+1. The user selects one or more receipt photos in the GUI (or supplies a file/directory to the command-line cropper).
+2. The app detects receipt boundaries and saves each receipt as a separate image in a unique processing job.
+3. OCR extracts a date from each crop; dates are associated with receipt images through their ISO filename prefix. Amount and vendor extraction are not implemented.
 4. The user selects the travel dates and workdays to expense, grouped into expense weeks.
 5. The app assigns each receipt to at most one selected expense week. A receipt qualifies when its date falls within the week or within two calendar days before or after it. If adjacent weeks qualify, the week containing the receipt date is chosen; alternate qualifying weeks are recorded without duplicating the receipt.
-6. (Later) Check that every Excel document to be generated has at least one qualifying associated receipt and notify the user if one does not.
+6. Weeks without a qualifying receipt are warned about and are not eligible for a future expense form. Excel generation is not implemented yet.
 7. (Later) Populate the spreadsheet template and embed associated receipt images.
 8. The completed claim is exported.
 
@@ -48,12 +48,23 @@ Do not commit actual Excel templates or receipt images.
 
 ## Receipt matching (step 5)
 
-The OCR date-extraction step currently stores its result in each cropped image's
+The OCR date-extraction step stores its result in each cropped image's
 filename: successfully dated images begin with `YYYY-MM-DD_`, for example
 `2025-04-02_shop_receipt_1.jpg`. These images in `data/processed/` are the
 matching input. Images without a valid date prefix are retained and appear in
 the unmatched list. The current OCR step does not persist amount, vendor, or
 raw OCR text.
+
+The GUI's **Add Receipt Photos** action accepts multiple images and runs
+detection/OCR in a background worker. Each run writes to a separate directory
+under `data/processed/jobs/`; interrupted jobs retain an `.incomplete` marker
+and are ignored by receipt loading. Job directories remain as an archive, but
+the GUI matches only jobs created during the current application run; previous
+jobs are never automatically reused. Each launch starts with an empty date
+selection and replaces the saved selection and match result, preventing a
+previous period from being picked up by a later workflow. To launch the GUI
+against a particular processed-receipt directory, use
+`py -m src.gui.date_selection --receipts-dir <path>`.
 
 An optional `data/processed/receipt_manifest.json` can provide additional
 receipt metadata or an explicit date. Its version-1 shape is:
@@ -78,11 +89,16 @@ Manifest image paths may be absolute or relative to `data/processed/`.
 `receipt_id` is optional (the image filename is used by default), as are
 `receipt_date`, `amount`, `vendor`, and `raw_ocr_text`. If no manifest is
 present, filename dates are used and the other fields remain empty.
+The processing workflow may also store `date_error` for a crop whose date
+could not be read, so later matching can distinguish that from an unprocessed
+image.
 
 Receipt status is recalculated immediately whenever a date is selected or
 cleared. Selected dates are filled green when their week has a qualifying
 receipt, or orange when it does not; the recheck button can be used after
-receipt files change while the GUI is open. Matching reads
+receipt files change while the GUI is open. Weeks without receipts are
+identified in the matching status and warned about when the selection is
+submitted; a future expense-form generator must omit those weeks. Matching reads
 `data/processed/expense_week_selection.json` and the processed receipt images,
 then writes the version-1 result to
 `data/processed/receipt_matches.json`. Each selected week remains in the result,
@@ -94,12 +110,14 @@ that contains the receipt date. Other qualifying weeks are listed in
 Missing/invalid dates and dated receipts outside every selected week are
 recorded in `unmatched_receipts`. A brief per-week summary, unmatched reasons,
 and output path appear below the calendar; matching no longer opens a results
-dialog.
+dialog. The GUI's **Save Selection** action saves the current selection; it
+does not submit a claim or generate an Excel file.
 
 The match result is structured for later consumers: each week includes its
-`week_id`, dates, `receipt_count`, receipt amounts, and image paths. Step 6's
-missing-receipt notification policy and step 7's Excel/image generation are not
-implemented by this step.
+`week_id`, dates, `receipt_count`, receipt amounts, and image paths. The GUI
+warns about zero-receipt weeks; `MatchResult.expense_form_weeks` exposes only
+weeks eligible for a future expense form. Excel/image generation is not
+implemented.
 
 ## Tesseract OCR installation
 

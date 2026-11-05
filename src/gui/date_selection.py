@@ -2,21 +2,32 @@
 
 from __future__ import annotations
 
+import argparse
 import calendar
+import queue
+import threading
 import tkinter as tk
 from datetime import date, timedelta
-from tkinter import messagebox, ttk
-from typing import Dict, List, Set
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+from typing import Dict, List, Optional, Set, Tuple
 
 from src.expense_weeks import (
     DEFAULT_SELECTION_PATH,
     create_selection,
     get_week_bounds,
+    load_selection,
     save_selection,
     toggle_week_dates,
     weekdays_in_week,
 )
+from src.receipt_processing import (
+    ProcessingProgress,
+    ReceiptProcessingResult,
+    process_uploaded_images,
+)
 from src.receipt_matching import run_matching_step
+from src.receipts import DEFAULT_RECEIPTS_DIRECTORY
 
 
 class DateSelectionApp:
@@ -30,8 +41,15 @@ class DateSelectionApp:
     PALE_BLUE = "#e8f0ff"
     BORDER = "#d8e0ef"
 
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        receipts_directory: Optional[Path] = None,
+    ) -> None:
         self.root = root
+        self.receipts_directory = Path(
+            receipts_directory or DEFAULT_RECEIPTS_DIRECTORY
+        )
         self.root.title("Fuel Expensor - Select Dates")
         self.root.geometry("1120x760")
         self.root.minsize(1000, 690)
@@ -41,9 +59,19 @@ class DateSelectionApp:
         self.first_month = today.replace(day=1)
         self.display_start = self.first_month
         self.display_end = self._month_end(self._add_months(self.first_month, 2))
-        self.selected_dates: Set[str] = set()
+        self.selected_dates, selection_error = self._restore_saved_selection()
+        self._selection_restored = selection_error is None and bool(self.selected_dates)
+        if self.selected_dates:
+            first_selected_date = min(date.fromisoformat(value) for value in self.selected_dates)
+            self.first_month = first_selected_date.replace(day=1)
+            self.display_start = self.first_month
+            self.display_end = self._month_end(self._add_months(self.first_month, 2))
         self.day_buttons: Dict[str, ttk.Button] = {}
         self.week_receipt_status: Dict[str, bool] = {}
+        self.weeks_without_receipts: Tuple[str, ...] = ()
+        self.matching_error: Optional[str] = None
+        self._processing_queue = queue.Queue()
+        self._processing_active = False
         self.mode = tk.StringVar(value="weeks")
         self.trip_am = tk.BooleanVar(value=True)
         self.trip_pm = tk.BooleanVar(value=True)
@@ -56,6 +84,28 @@ class DateSelectionApp:
         self._build_layout()
         self._set_mode(self.mode.get())
         self._render_calendars()
+        if selection_error is not None:
+            self.root.after_idle(
+                lambda error=selection_error: messagebox.showerror(
+                    "Could not restore selection", error, parent=self.root
+                )
+            )
+        elif self._selection_restored:
+            self._match_receipts()
+
+    @staticmethod
+    def _restore_saved_selection() -> Tuple[Set[str], Optional[str]]:
+        try:
+            selection = load_selection(DEFAULT_SELECTION_PATH)
+        except FileNotFoundError:
+            return set(), None
+        except (OSError, TypeError, ValueError) as error:
+            return set(), str(error)
+        return {
+            selected_date
+            for week in selection.weeks
+            for selected_date in week.selected_dates
+        }, None
 
     @staticmethod
     def _add_months(value: date, months: int) -> date:
@@ -199,6 +249,22 @@ class DateSelectionApp:
             )
             button.pack(side="left", padx=(8 if value == "weeks" else 4, 0))
             self.mode_buttons[value] = button
+
+        upload_bar = ttk.Frame(self.calendar_card, style="Card.TFrame")
+        upload_bar.pack(fill="x", pady=(0, 6))
+        self.upload_button = ttk.Button(
+            upload_bar,
+            text="Add Receipt Photos",
+            command=self._select_receipt_images,
+        )
+        self.upload_button.pack(side="left")
+        self.processing_status_var = tk.StringVar(value="No receipt images processing.")
+        ttk.Label(
+            upload_bar,
+            textvariable=self.processing_status_var,
+            style="Muted.TLabel",
+            anchor="e",
+        ).pack(side="left", fill="x", expand=True, padx=(8, 0))
 
         self.mode_hint = tk.StringVar()
         ttk.Label(
@@ -430,6 +496,96 @@ class DateSelectionApp:
                 current = date(month.year, month.month, day_number)
                 self._add_day_button(panel, current, row_index, weekday)
 
+    def _select_receipt_images(self) -> None:
+        image_paths = filedialog.askopenfilenames(
+            parent=self.root,
+            title="Select receipt photos",
+            filetypes=[
+                ("Receipt images", "*.bmp *.jpeg *.jpg *.png *.tif *.tiff *.webp"),
+                ("All files", "*.*"),
+            ],
+        )
+        if image_paths:
+            self._start_receipt_processing(tuple(Path(path) for path in image_paths))
+
+    def _start_receipt_processing(self, image_paths: Tuple[Path, ...]) -> None:
+        if self._processing_active:
+            return
+        self._processing_active = True
+        self.upload_button.configure(state="disabled")
+        self.processing_status_var.set(
+            "Starting receipt processing for {} image(s)...".format(len(image_paths))
+        )
+        worker = threading.Thread(
+            target=self._receipt_processing_worker,
+            args=(image_paths,),
+            daemon=True,
+        )
+        worker.start()
+        self.root.after(100, self._poll_receipt_processing)
+
+    def _receipt_processing_worker(self, image_paths: Tuple[Path, ...]) -> None:
+        try:
+            result = process_uploaded_images(
+                image_paths,
+                progress_callback=lambda progress: self._processing_queue.put(
+                    ("progress", progress)
+                ),
+            )
+        except Exception as error:
+            self._processing_queue.put(("error", str(error)))
+        else:
+            self._processing_queue.put(("complete", result))
+
+    def _poll_receipt_processing(self) -> None:
+        while True:
+            try:
+                event, value = self._processing_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if event == "progress":
+                progress: ProcessingProgress = value
+                self.processing_status_var.set(
+                    "{}: {} of {} — {}".format(
+                        "Detecting receipts"
+                        if progress.stage == "detecting"
+                        else "Reading receipt dates",
+                        progress.completed,
+                        progress.total,
+                        progress.message,
+                    )
+                )
+            elif event == "error":
+                self._processing_active = False
+                self.upload_button.configure(state="normal")
+                self.processing_status_var.set("Receipt processing failed.")
+                messagebox.showerror(
+                    "Receipt processing failed", value, parent=self.root
+                )
+            elif event == "complete":
+                result: ReceiptProcessingResult = value
+                self._processing_active = False
+                self.upload_button.configure(state="normal")
+                self.processing_status_var.set(
+                    "Finished: {} image(s), {} receipt(s), {} issue(s).".format(
+                        result.input_count,
+                        result.detected_receipt_count,
+                        len(result.errors) + len(result.warnings),
+                    )
+                )
+                if result.errors or result.warnings:
+                    details = list(result.errors) + list(result.warnings)
+                    messagebox.showwarning(
+                        "Receipt processing finished with issues",
+                        "\n".join(details),
+                        parent=self.root,
+                    )
+                self._match_receipts()
+
+        if self._processing_active:
+            self.root.after(100, self._poll_receipt_processing)
+
     def _add_day_button(
         self, parent: ttk.Frame, current: date, row: int, column: int
     ) -> None:
@@ -527,11 +683,32 @@ class DateSelectionApp:
                 "Could not save selection", str(error), parent=self.root
             )
             return
-        messagebox.showinfo(
-            "Selection saved",
-            "Expense dates saved to:\n{}".format(saved_path.resolve()),
-            parent=self.root,
-        )
+        if self.weeks_without_receipts:
+            messagebox.showwarning(
+                "Selection saved with receipt warnings",
+                "Expense dates saved to:\n{}\n\n"
+                "No receipt was matched to these weeks: {}. "
+                "They will not be included in an expense form.".format(
+                    saved_path.resolve(),
+                    ", ".join(self.weeks_without_receipts),
+                ),
+                parent=self.root,
+            )
+        elif self.matching_error is not None:
+            messagebox.showwarning(
+                "Receipt coverage could not be verified",
+                "Expense dates were saved, but receipt matching failed. "
+                "Check the receipt status before creating an expense form.\n\n{}".format(
+                    self.matching_error
+                ),
+                parent=self.root,
+            )
+        else:
+            messagebox.showinfo(
+                "Selection saved",
+                "Expense dates saved to:\n{}".format(saved_path.resolve()),
+                parent=self.root,
+            )
 
     def _match_receipts(self) -> None:
         """Save the current selection, match receipts, and update calendar colors."""
@@ -540,16 +717,30 @@ class DateSelectionApp:
             save_selection(selection, DEFAULT_SELECTION_PATH)
             result, output_path = run_matching_step(
                 selection_path=DEFAULT_SELECTION_PATH,
+                receipts_directory=self.receipts_directory,
+                manifest_path=self.receipts_directory / "receipt_manifest.json",
             )
         except (OSError, ValueError) as error:
+            self.matching_error = str(error)
+            self.week_receipt_status = {}
+            self.weeks_without_receipts = ()
+            self._refresh_calendar_buttons()
+            self.match_status_var.set(
+                "Receipt matching failed: {}".format(self.matching_error)
+            )
+            self.match_status_label.pack(
+                fill="x", pady=(8, 0), before=self.summary_label
+            )
             messagebox.showerror(
                 "Could not match receipts", str(error), parent=self.root
             )
             return
 
+        self.matching_error = None
         self.week_receipt_status = {
             week.week_id: week.receipt_count > 0 for week in result.weeks
         }
+        self.weeks_without_receipts = result.weeks_without_receipts
         self._refresh_calendar_buttons()
 
         lines = [
@@ -560,11 +751,23 @@ class DateSelectionApp:
             "{}: {} receipt(s)".format(week.week_id, week.receipt_count)
             for week in result.weeks
         )
+        if self.weeks_without_receipts:
+            lines.append(
+                "Warning: weeks without receipts will not be included in an expense form: {}.".format(
+                    ", ".join(self.weeks_without_receipts)
+                )
+            )
         if result.unmatched_receipts:
             lines.append(
                 "Unmatched: {}".format(
                     ", ".join(
-                        "{} ({})".format(receipt.receipt_id, receipt.reason)
+                        "{} ({}){}".format(
+                            receipt.receipt_id,
+                            receipt.reason,
+                            ": {}".format(receipt.date_error)
+                            if receipt.date_error
+                            else "",
+                        )
                         for receipt in result.unmatched_receipts
                     )
                 )
@@ -578,10 +781,18 @@ class DateSelectionApp:
         )
 
 
-def main() -> None:
+def main(argv: Optional[List[str]] = None) -> None:
     """Launch the date-selection window."""
+    parser = argparse.ArgumentParser(description="Select travel dates and match receipts.")
+    parser.add_argument(
+        "--receipts-dir",
+        type=Path,
+        default=DEFAULT_RECEIPTS_DIRECTORY,
+        help="Directory containing processed receipt images",
+    )
+    args = parser.parse_args(argv)
     root = tk.Tk()
-    DateSelectionApp(root)
+    DateSelectionApp(root, receipts_directory=args.receipts_dir)
     root.mainloop()
 
 

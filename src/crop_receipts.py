@@ -1,6 +1,9 @@
 import argparse
+import hashlib
 import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Optional, Sequence, Tuple
 
 import cv2
 from ultralytics import YOLO
@@ -32,7 +35,14 @@ DEFAULT_MODEL_PATH = os.path.join(PROJECT_ROOT, "data", "models", "receipt_detec
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 
 
-def crop_receipts(model_path, input_path, output_path):
+@dataclass(frozen=True)
+class ImageCropResult:
+    source_path: Path
+    receipt_paths: Tuple[Path, ...]
+    error: Optional[str] = None
+
+
+def _image_paths(input_path):
     input_is_directory = os.path.isdir(input_path)
     if input_is_directory:
         image_paths = sorted(
@@ -47,54 +57,107 @@ def crop_receipts(model_path, input_path, output_path):
         image_paths = [input_path]
     else:
         raise FileNotFoundError(f"Input image or directory does not exist: {input_path}")
+    return image_paths
+
+
+def crop_receipts_for_images(
+    model_path,
+    image_paths: Sequence[Path],
+    output_path,
+    progress_callback: Optional[Callable[[int, int, Path], None]] = None,
+) -> Tuple[ImageCropResult, ...]:
+    """Crop each input independently, retaining per-image failures."""
+    normalized_paths = tuple(Path(image_path) for image_path in image_paths)
+    if not normalized_paths:
+        raise ValueError("At least one input image is required.")
 
     os.makedirs(output_path, exist_ok=True)
     model = YOLO(model_path)
+    results = []
+
+    for index, image_path in enumerate(normalized_paths, start=1):
+        receipt_paths = []
+        error_message = None
+        try:
+            image = cv2.imread(str(image_path))
+            if image is None:
+                raise ValueError(f"Unable to load image: {image_path}")
+
+            detections = model(image)
+
+            source_digest = hashlib.sha256(
+                str(image_path.resolve()).encode("utf-8")
+            ).hexdigest()[:10]
+            output_stem = "{}_{}_{}".format(
+                image_path.stem, source_digest, Path(output_path).name
+            )
+            for detection in detections:
+                if detection.boxes is None:
+                    continue
+                boxes = detection.boxes.cpu().numpy()
+                for box in boxes:
+                    xyxy = box.xyxy[0]
+                    if hasattr(xyxy, "cpu"):
+                        xyxy = xyxy.cpu().numpy()
+                    x1, y1, x2, y2 = xyxy.astype(int)
+                    x1 = max(0, x1 - 10)
+                    y1 = max(0, y1 - 10)
+                    x2 = min(image.shape[1], x2 + 10)
+                    y2 = min(image.shape[0], y2 + 10)
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+
+                    cropped_receipt = image[y1:y2, x1:x2]
+                    output_file = Path(output_path) / "{}_receipt_{}.jpg".format(
+                        output_stem, len(receipt_paths) + 1
+                    )
+                    if output_file.exists():
+                        raise FileExistsError(
+                            "Refusing to overwrite an existing receipt crop: {}".format(
+                                output_file
+                            )
+                        )
+                    if not cv2.imwrite(str(output_file), cropped_receipt):
+                        raise OSError(
+                            "Unable to write cropped receipt: {}".format(output_file)
+                        )
+                    receipt_paths.append(output_file)
+        except Exception as error:
+            error_message = str(error)
+
+        results.append(
+            ImageCropResult(
+                source_path=image_path,
+                receipt_paths=tuple(receipt_paths),
+                error=error_message,
+            )
+        )
+        if progress_callback is not None:
+            progress_callback(index, len(normalized_paths), image_path)
+
+    return tuple(results)
+
+
+def crop_receipts(model_path, input_path, output_path):
+    image_paths = [Path(path) for path in _image_paths(input_path)]
+    results = crop_receipts_for_images(model_path, image_paths, output_path)
     total_detections = 0
+    errors = []
+    for result in results:
+        total_detections += len(result.receipt_paths)
+        print(
+            "{}: {} receipt(s) detected".format(
+                result.source_path, len(result.receipt_paths)
+            )
+        )
+        if result.error:
+            errors.append("{}: {}".format(result.source_path, result.error))
 
-    for image_path in image_paths:
-        image = cv2.imread(image_path)
-        if image is None:
-            raise ValueError(f"Unable to load image: {image_path}")
-
-        # Run inference
-        results = model(image)
-        image_detections = 0
-
-        # Extract bounding boxes and crop receipts
-        for result in results:
-            if result.boxes is None:
-                continue
-            boxes = result.boxes.cpu().numpy()
-            for box in boxes:
-                xyxy = box.xyxy[0]
-                if hasattr(xyxy, "cpu"):
-                    xyxy = xyxy.cpu().numpy()
-                x1, y1, x2, y2 = xyxy.astype(int)
-                x1 = max(0, x1 - 10)
-                y1 = max(0, y1 - 10)
-                x2 = min(image.shape[1], x2 + 10)
-                y2 = min(image.shape[0], y2 + 10)
-
-                # Crop the receipt
-                cropped_receipt = image[y1:y2, x1:x2]
-                image_detections += 1
-                output_stem = (
-                    Path(image_path).stem
-                    if input_is_directory
-                    else Path(model_path).stem
-                )
-                output_filename = os.path.join(
-                    output_path,
-                    f"{output_stem}_receipt_{image_detections}.jpg",
-                )
-                if not cv2.imwrite(output_filename, cropped_receipt):
-                    raise OSError(f"Unable to write cropped receipt: {output_filename}")
-
-        total_detections += image_detections
-        print(f"{image_path}: {image_detections} receipt(s) detected")
-
-    print(f"Number of receipts detected: {total_detections}")
+    print("Number of receipts detected: {}".format(total_detections))
+    if errors:
+        raise RuntimeError("One or more images could not be processed:\n{}".format(
+            "\n".join(errors)
+        ))
     return total_detections
 
 

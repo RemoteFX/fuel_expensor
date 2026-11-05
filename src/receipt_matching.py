@@ -120,6 +120,16 @@ class MatchResult:
     weeks: Tuple[WeekMatch, ...]
     unmatched_receipts: Tuple[UnmatchedReceipt, ...]
 
+    @property
+    def expense_form_weeks(self) -> Tuple[WeekMatch, ...]:
+        """Return only weeks with receipts for a future expense-form consumer."""
+        return tuple(week for week in self.weeks if week.receipt_count > 0)
+
+    @property
+    def weeks_without_receipts(self) -> Tuple[str, ...]:
+        """Return selected week IDs that should be warned about and excluded."""
+        return tuple(week.week_id for week in self.weeks if week.receipt_count == 0)
+
     def to_dict(self) -> dict:
         """Return the stable public JSON structure."""
         return {

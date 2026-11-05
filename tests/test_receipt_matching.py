@@ -246,7 +246,9 @@ def test_gui_match_action_saves_current_selection_before_matching(
     output_path = tmp_path / "receipt_matches.json"
     seen_selection = []
 
-    def run_saved_selection(selection_path):
+    def run_saved_selection(selection_path, receipts_directory, manifest_path):
+        assert receipts_directory == tmp_path / "processed"
+        assert manifest_path == tmp_path / "processed" / "receipt_manifest.json"
         selection = load_selection(selection_path)
         seen_selection.append(selection)
         return match_receipts([], selection), output_path
@@ -266,6 +268,7 @@ def test_gui_match_action_saves_current_selection_before_matching(
 
     app = type("App", (), {})()
     app.selected_dates = {"2025-04-02", "2025-04-08"}
+    app.receipts_directory = tmp_path / "processed"
     app.week_receipt_status = {}
     app.root = None
     app.match_status_var = TextVariable()
@@ -285,6 +288,8 @@ def test_gui_match_action_saves_current_selection_before_matching(
     }
     assert "orange dates" in app.match_status_var.value
     assert "receipt_matches.json" in app.match_status_var.value
+    assert app.weeks_without_receipts == ("2025-03-31", "2025-04-07")
+    assert "will not be included in an expense form" in app.match_status_var.value
 
 
 def test_calendar_refresh_colors_selected_dates_by_week_receipt_status():
@@ -323,3 +328,92 @@ def test_date_click_triggers_receipt_check_immediately(monkeypatch):
     DateSelectionApp._on_date_click(app, date(2025, 4, 2))
 
     assert checked == [{"2025-04-02"}]
+
+
+def test_match_result_exposes_only_receipt_eligible_expense_form_weeks():
+    result = match_receipts(
+        [_receipt("matched", date(2025, 4, 2))],
+        _selection("2025-04-02", "2025-04-08"),
+    )
+
+    assert tuple(week.week_id for week in result.expense_form_weeks) == (
+        "2025-03-31",
+    )
+    assert result.weeks_without_receipts == ("2025-04-07",)
+
+
+def test_saving_selection_warns_about_weeks_without_receipts(tmp_path, monkeypatch):
+    import src.gui.date_selection as date_selection
+
+    warnings = []
+    selection_path = tmp_path / "selection.json"
+    monkeypatch.setattr(date_selection, "DEFAULT_SELECTION_PATH", selection_path)
+    monkeypatch.setattr(
+        date_selection,
+        "save_selection",
+        lambda _selection, path: path,
+    )
+    monkeypatch.setattr(
+        date_selection.messagebox,
+        "showwarning",
+        lambda title, message, parent: warnings.append((title, message)),
+    )
+
+    app = type("App", (), {})()
+    app.selected_dates = {"2025-04-02", "2025-04-08"}
+    app.weeks_without_receipts = ("2025-04-07",)
+    app.root = None
+
+    DateSelectionApp._save_selection(app)
+
+    assert len(warnings) == 1
+    assert "2025-04-07" in warnings[0][1]
+    assert "will not be included in an expense form" in warnings[0][1]
+
+
+def test_failed_matching_clears_stale_coverage_and_reports_error(
+    tmp_path, monkeypatch
+):
+    import src.gui.date_selection as date_selection
+
+    errors = []
+    selection_path = tmp_path / "selection.json"
+    monkeypatch.setattr(date_selection, "DEFAULT_SELECTION_PATH", selection_path)
+    monkeypatch.setattr(
+        date_selection,
+        "run_matching_step",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("receipt folder unavailable")),
+    )
+    monkeypatch.setattr(
+        date_selection.messagebox,
+        "showerror",
+        lambda _title, message, parent: errors.append(message),
+    )
+
+    class TextVariable:
+        def set(self, value):
+            self.value = value
+
+    class StatusLabel:
+        def pack(self, **_kwargs):
+            pass
+
+    app = type("App", (), {})()
+    app.selected_dates = {"2025-04-02"}
+    app.receipts_directory = tmp_path / "processed"
+    app.week_receipt_status = {"2025-03-31": True}
+    app.weeks_without_receipts = ("2025-04-07",)
+    app.matching_error = None
+    app.root = None
+    app.match_status_var = TextVariable()
+    app.match_status_label = StatusLabel()
+    app.summary_label = object()
+    app._refresh_calendar_buttons = lambda: None
+
+    DateSelectionApp._match_receipts(app)
+
+    assert app.week_receipt_status == {}
+    assert app.weeks_without_receipts == ()
+    assert "receipt folder unavailable" in app.matching_error
+    assert "receipt folder unavailable" in app.match_status_var.value
+    assert errors == ["receipt folder unavailable"]

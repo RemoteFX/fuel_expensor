@@ -65,6 +65,8 @@ def crop_receipts_for_images(
     image_paths: Sequence[Path],
     output_path,
     progress_callback: Optional[Callable[[int, int, Path], None]] = None,
+    verbose: bool = False,
+    log_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[ImageCropResult, ...]:
     """Crop each input independently, retaining per-image failures."""
     normalized_paths = tuple(Path(image_path) for image_path in image_paths)
@@ -83,7 +85,7 @@ def crop_receipts_for_images(
             if image is None:
                 raise ValueError(f"Unable to load image: {image_path}")
 
-            detections = model(image)
+            detections = model(image, verbose=verbose)
 
             source_digest = hashlib.sha256(
                 str(image_path.resolve()).encode("utf-8")
@@ -132,28 +134,40 @@ def crop_receipts_for_images(
                 error=error_message,
             )
         )
+        if verbose and log_callback is not None:
+            log_callback(
+                "{}: {} receipt(s) detected{}".format(
+                    image_path,
+                    len(receipt_paths),
+                    ": {}".format(error_message) if error_message else "",
+                )
+            )
         if progress_callback is not None:
             progress_callback(index, len(normalized_paths), image_path)
 
     return tuple(results)
 
 
-def crop_receipts(model_path, input_path, output_path):
+def crop_receipts(model_path, input_path, output_path, verbose=True):
     image_paths = [Path(path) for path in _image_paths(input_path)]
-    results = crop_receipts_for_images(model_path, image_paths, output_path)
+    results = crop_receipts_for_images(
+        model_path, image_paths, output_path, verbose=verbose
+    )
     total_detections = 0
     errors = []
     for result in results:
         total_detections += len(result.receipt_paths)
-        print(
-            "{}: {} receipt(s) detected".format(
-                result.source_path, len(result.receipt_paths)
+        if verbose:
+            print(
+                "{}: {} receipt(s) detected".format(
+                    result.source_path, len(result.receipt_paths)
+                )
             )
-        )
         if result.error:
             errors.append("{}: {}".format(result.source_path, result.error))
 
-    print("Number of receipts detected: {}".format(total_detections))
+    if verbose:
+        print("Number of receipts detected: {}".format(total_detections))
     if errors:
         raise RuntimeError("One or more images could not be processed:\n{}".format(
             "\n".join(errors)

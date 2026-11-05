@@ -58,9 +58,13 @@ raw OCR text.
 The GUI's **Add Receipt Photos** action accepts multiple images and runs
 detection/OCR in a background worker. Each run writes to a separate directory
 under `data/processed/jobs/`; interrupted jobs retain an `.incomplete` marker
-and are ignored by receipt loading. To launch the GUI against a particular
-processed-receipt directory, use `py -m src.gui.date_selection --receipts-dir
-<path>`. The GUI restores a valid saved date selection on startup.
+and are ignored by receipt loading. Job directories remain as an archive, but
+the GUI matches only jobs created during the current application run; previous
+jobs are never automatically reused. Each launch starts with an empty date
+selection and replaces the saved selection and match result, preventing a
+previous period from being picked up by a later workflow. To launch the GUI
+against a particular processed-receipt directory, use
+`py -m src.gui.date_selection --receipts-dir <path>`.
 
 An optional `data/processed/receipt_manifest.json` can provide additional
 receipt metadata or an explicit date. Its version-1 shape is:
@@ -106,7 +110,8 @@ that contains the receipt date. Other qualifying weeks are listed in
 Missing/invalid dates and dated receipts outside every selected week are
 recorded in `unmatched_receipts`. A brief per-week summary, unmatched reasons,
 and output path appear below the calendar; matching no longer opens a results
-dialog.
+dialog. The GUI's **Save Selection** action saves the current selection; it
+does not submit a claim or generate an Excel file.
 
 The match result is structured for later consumers: each week includes its
 `week_id`, dates, `receipt_count`, receipt amounts, and image paths. The GUI

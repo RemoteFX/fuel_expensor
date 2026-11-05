@@ -24,7 +24,8 @@ class _Model:
     def __init__(self, _model_path):
         pass
 
-    def __call__(self, _image):
+    def __call__(self, _image, verbose=False):
+        assert verbose is False
         return [SimpleNamespace(boxes=_Boxes())]
 
 

@@ -208,6 +208,8 @@ def extract_best_date(image_path: Path) -> Optional[str]:
 def process_receipts(
     input_dir: Path,
     progress_callback: Optional[Callable[[int, int, Path], None]] = None,
+    verbose: bool = False,
+    log_callback: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """
     Process all receipt images in directory and prepend ISO date prefix YYYY-MM-DD_.
@@ -239,7 +241,11 @@ def process_receipts(
         summary["processed"] += 1
         clean_name = iso_prefix_regex.sub('', file_path.name)
 
-        logger.info(f"Processing: {file_path.name}")
+        if verbose:
+            message = "Processing: {}".format(file_path.name)
+            logger.info(message)
+            if log_callback is not None:
+                log_callback(message)
         try:
             extracted_date = extract_best_date(file_path)
 
@@ -256,9 +262,21 @@ def process_receipts(
                         )
                     file_path.rename(new_path)
                     summary["renamed"] += 1
-                    logger.info(f"Successfully extracted date {extracted_date} -> Renamed to {new_name}")
+                    if verbose:
+                        message = "Successfully extracted date {} -> Renamed to {}".format(
+                            extracted_date, new_name
+                        )
+                        logger.info(message)
+                        if log_callback is not None:
+                            log_callback(message)
                 else:
-                    logger.info(f"Filename already up to date: {file_path.name}")
+                    if verbose:
+                        message = "Filename already up to date: {}".format(
+                            file_path.name
+                        )
+                        logger.info(message)
+                        if log_callback is not None:
+                            log_callback(message)
                 summary["items"].append(
                     {
                         "image_path": str(new_path),
@@ -268,7 +286,13 @@ def process_receipts(
                 )
             else:
                 summary["failed"] += 1
-                logger.warning(f"Could not extract valid date from: {file_path.name}")
+                if verbose:
+                    message = "Could not extract valid date from: {}".format(
+                        file_path.name
+                    )
+                    logger.warning(message)
+                    if log_callback is not None:
+                        log_callback(message)
                 summary["items"].append(
                     {
                         "image_path": str(file_path),
@@ -287,7 +311,10 @@ def process_receipts(
                     "error": str(error),
                 }
             )
-            logger.exception("Could not process receipt image: %s", file_path)
+            if verbose:
+                logger.exception("Could not process receipt image: %s", file_path)
+                if log_callback is not None:
+                    log_callback(error_message)
         if progress_callback is not None:
             progress_callback(index, len(files), file_path)
 
@@ -302,7 +329,7 @@ def main():
     input_dir = Path(args.input_dir)
     logger.info(f"Starting receipt date extraction in {input_dir}")
     try:
-        summary = process_receipts(input_dir)
+        summary = process_receipts(input_dir, verbose=True)
     except (OSError, ValueError) as error:
         logger.error("Receipt date extraction could not start: %s", error)
         return 1

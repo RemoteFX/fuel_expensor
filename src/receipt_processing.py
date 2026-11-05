@@ -52,6 +52,7 @@ class ReceiptProcessingResult:
 
 
 ProgressCallback = Callable[[ProcessingProgress], None]
+LogCallback = Callable[[str], None]
 
 
 def process_uploaded_images(
@@ -59,6 +60,8 @@ def process_uploaded_images(
     output_root: Path = DEFAULT_JOB_DIRECTORY,
     model_path: Path = Path(DEFAULT_MODEL_PATH),
     progress_callback: Optional[ProgressCallback] = None,
+    verbose: bool = False,
+    log_callback: Optional[LogCallback] = None,
 ) -> ReceiptProcessingResult:
     """Crop and date uploaded images in a unique job directory.
 
@@ -101,6 +104,10 @@ def process_uploaded_images(
                 )
             )
 
+    def report_log(message: str) -> None:
+        if verbose and log_callback is not None:
+            log_callback(message)
+
     crop_results = crop_receipts_for_images(
         model_path,
         normalized_paths,
@@ -108,6 +115,8 @@ def process_uploaded_images(
         progress_callback=lambda completed, total, path: report(
             "detecting", completed, total, path
         ),
+        verbose=verbose,
+        log_callback=report_log,
     )
     detected_count = sum(len(result.receipt_paths) for result in crop_results)
     for result in crop_results:
@@ -140,6 +149,8 @@ def process_uploaded_images(
         progress_callback=lambda completed, total, path: report(
             "reading_dates", completed, total, path
         ),
+        verbose=verbose,
+        log_callback=report_log,
     )
     errors.extend(ocr_summary["errors"])
     item_results.extend(

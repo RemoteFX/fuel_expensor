@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Final, Iterable, List, Optional, Tuple
+from typing import Final, Iterable, List, Optional, Sequence, Tuple
 
 from src.expense_weeks import (
     DEFAULT_SELECTION_PATH,
@@ -454,14 +454,30 @@ def run_matching_step(
     receipts_directory: Path = DEFAULT_RECEIPTS_DIRECTORY,
     output_path: Path = DEFAULT_MATCH_RESULT_PATH,
     manifest_path: Optional[Path] = DEFAULT_RECEIPT_MANIFEST_PATH,
+    receipt_job_directories: Optional[Sequence[Path]] = None,
 ) -> Tuple[MatchResult, Path]:
-    """Load step-4 selections and receipts, match them, and persist the result."""
+    """Load selections and receipts, match them, and persist the result.
+
+    When ``receipt_job_directories`` is provided, only receipts in those
+    explicit jobs are considered. An empty sequence intentionally matches no
+    receipts; ``None`` retains the legacy directory-wide discovery behavior.
+    """
     saved_selection_path = Path(selection_path)
     selection = load_selection(saved_selection_path)
-    receipts = load_receipts(
-        receipts_directory=receipts_directory,
-        manifest_path=manifest_path,
-    )
+    if receipt_job_directories is None:
+        receipts = load_receipts(
+            receipts_directory=receipts_directory,
+            manifest_path=manifest_path,
+        )
+    else:
+        receipts = tuple(
+            receipt
+            for job_directory in receipt_job_directories
+            for receipt in load_receipts(
+                receipts_directory=job_directory,
+                manifest_path=Path(job_directory) / "receipt_manifest.json",
+            )
+        )
     result = match_receipts(
         receipts,
         selection,

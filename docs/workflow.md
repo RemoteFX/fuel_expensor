@@ -23,18 +23,20 @@ raw OCR text, and explicit receipt dates can be supplied using the version-1
 The GUI's **Add Receipt Photos** action starts processing on a background
 worker. Progress and completion are delivered back to Tk's main loop. Each
 processing run has its own output directory; directories marked `.incomplete`
-are ignored after an interrupted run. A saved, valid date selection is restored
-when the GUI starts.
+are ignored after an interrupted run. Job directories are retained as an
+archive, but matching uses only jobs created during the current GUI run. Every
+launch starts with an empty date selection and writes an empty match result
+before new dates or images are added, so previous-period data is not reused.
 
 Run the date-selection GUI with `py -m src.gui.date_selection`. Receipt
 matching reruns automatically whenever a date is selected or cleared, saving
 the current selection and result. Selected dates are filled green when their
-week has a qualifying receipt and orange when it does not. Use **Recheck
-receipts** after receipt files change while the GUI is open. Each selected week
+week has a qualifying receipt and orange when it does not. Each selected week
 is present in the output even when it has zero matches. The matcher uses the
 shared week-boundary helpers in `src/expense_weeks.py`. The GUI warns about
-zero-receipt weeks; Excel generation is not implemented. A brief summary,
-unmatched reasons, and output path appear below the calendar.
+zero-receipt weeks; Excel generation is not implemented. The **Save Selection**
+button only saves dates and does not submit a claim. A brief summary, unmatched
+reasons, and output path appear below the calendar.
 
 ## Current assumptions
 

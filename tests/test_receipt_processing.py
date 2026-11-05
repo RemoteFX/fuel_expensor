@@ -17,14 +17,25 @@ def test_processing_job_isolated_and_returns_receipts_and_progress(
     source.touch()
     progress = []
 
-    def fake_crop(_model_path, image_paths, output_path, progress_callback=None):
+    def fake_crop(
+        _model_path,
+        image_paths,
+        output_path,
+        progress_callback=None,
+        verbose=False,
+        log_callback=None,
+    ):
+        assert verbose is False
         output = Path(output_path) / "receipt_crop.jpg"
         output.touch()
         if progress_callback:
             progress_callback(1, len(image_paths), image_paths[0])
         return (ImageCropResult(image_paths[0], (output,)),)
 
-    def fake_ocr(input_dir, progress_callback=None):
+    def fake_ocr(
+        input_dir, progress_callback=None, verbose=False, log_callback=None
+    ):
+        assert verbose is False
         source_crop = Path(input_dir) / "receipt_crop.jpg"
         dated_crop = Path(input_dir) / "2025-04-02_receipt_crop.jpg"
         source_crop.rename(dated_crop)
@@ -61,18 +72,79 @@ def test_processing_job_isolated_and_returns_receipts_and_progress(
     assert load_receipts(tmp_path / "jobs") == result.receipts
 
 
+def test_verbose_processing_routes_details_to_callback(tmp_path, monkeypatch):
+    source = tmp_path / "receipt.jpg"
+    source.touch()
+    logs = []
+
+    def fake_crop(
+        _model_path,
+        image_paths,
+        output_path,
+        progress_callback=None,
+        verbose=False,
+        log_callback=None,
+    ):
+        assert verbose is True
+        output = Path(output_path) / "receipt_crop.jpg"
+        output.touch()
+        log_callback("receipt crop details")
+        return (ImageCropResult(image_paths[0], (output,)),)
+
+    def fake_ocr(
+        input_dir, progress_callback=None, verbose=False, log_callback=None
+    ):
+        assert verbose is True
+        crop = Path(input_dir) / "receipt_crop.jpg"
+        dated = Path(input_dir) / "2025-04-02_receipt_crop.jpg"
+        crop.rename(dated)
+        log_callback("OCR date details")
+        return {
+            "errors": [],
+            "items": [
+                {
+                    "image_path": str(dated),
+                    "status": "dated",
+                    "receipt_date": "2025-04-02",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(receipt_processing, "crop_receipts_for_images", fake_crop)
+    monkeypatch.setattr(receipt_processing, "process_receipts", fake_ocr)
+
+    receipt_processing.process_uploaded_images(
+        [source],
+        output_root=tmp_path / "jobs",
+        model_path=Path("unused.pt"),
+        verbose=True,
+        log_callback=logs.append,
+    )
+
+    assert logs == ["receipt crop details", "OCR date details"]
+
+
 def test_incomplete_processing_job_is_not_loaded(tmp_path, monkeypatch):
     source = tmp_path / "receipt.jpg"
     source.touch()
     created_jobs = []
 
-    def fake_crop(_model_path, image_paths, output_path, progress_callback=None):
+    def fake_crop(
+        _model_path,
+        image_paths,
+        output_path,
+        progress_callback=None,
+        verbose=False,
+        log_callback=None,
+    ):
         output = Path(output_path) / "receipt_crop.jpg"
         output.touch()
         created_jobs.append(Path(output_path))
         return (ImageCropResult(image_paths[0], (output,)),)
 
-    def fail_ocr(_input_dir, progress_callback=None):
+    def fail_ocr(
+        _input_dir, progress_callback=None, verbose=False, log_callback=None
+    ):
         raise RuntimeError("OCR backend failed")
 
     monkeypatch.setattr(receipt_processing, "crop_receipts_for_images", fake_crop)
